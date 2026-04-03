@@ -29,18 +29,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     cookie, runs device discovery, and starts the data coordinator.
     """
     amazon_domain = entry.data[CONF_AMAZON_DOMAIN]
-    cookie = entry.data.get(CONF_COOKIE)
+    registration_data = entry.data.get(CONF_COOKIE)
 
-    if not cookie:
+    # Support both new dict format and legacy raw cookie string
+    if isinstance(registration_data, str):
+        registration_data = {"localCookie": registration_data, "loginCookie": registration_data}
+
+    if not registration_data or not registration_data.get("localCookie"):
         _LOGGER.error(
-            "No Alexa session cookie found. Re-authentication required."
+            "No Alexa session data found. Re-authentication required."
         )
-        raise ConfigEntryAuthFailed("Missing Alexa session cookie")
+        raise ConfigEntryAuthFailed("Missing Alexa session data")
 
     # Create a single long-lived aiohttp session for the lifetime of the entry
     session = aiohttp.ClientSession()
     api = AlexaApiClient(amazon_domain=amazon_domain, session=session)
-    api.set_cookie(cookie)
+    api.set_registration_data(registration_data)
 
     coordinator = AlexaDataUpdateCoordinator(hass, entry, api)
 

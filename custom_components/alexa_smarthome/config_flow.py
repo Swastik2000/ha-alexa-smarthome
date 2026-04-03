@@ -111,7 +111,7 @@ class AlexaSmartHomeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 proxy_port=self._config[CONF_PROXY_PORT],
                 ha_host=ha_host,
             )
-            # Reuse a previously saved cookie if available
+            # Reuse previously saved registration data if available
             existing = await self._auth_manager.load_cookie()
             if existing:
                 self._config[CONF_COOKIE] = existing
@@ -122,11 +122,11 @@ class AlexaSmartHomeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             await self._auth_manager.start_server()
 
         if user_input is not None:
-            # User clicked Submit — check whether the bookmarklet fired
-            cookie = await self._auth_manager.get_session_cookie()
-            if cookie:
+            # User clicked Submit — check whether login + registration completed
+            reg_data = await self._auth_manager.get_registration_data()
+            if reg_data:
                 await self._auth_manager.stop_server()
-                self._config[CONF_COOKIE] = cookie
+                self._config[CONF_COOKIE] = reg_data
                 return self.async_create_entry(
                     title=f"Alexa ({self._config[CONF_AMAZON_DOMAIN]})",
                     data=self._config,

@@ -501,12 +501,21 @@ def _extract_range_features(
 # ---------------------------------------------------------------------------
 
 
+_API_USER_AGENT = (
+    "AppleWebKit PitanguiBridge/2.2.595606.0-"
+    "[HARDWARE=iPhone14_7][SOFTWARE=17.4.1][DEVICE=iPhone]"
+)
+
+
 class AlexaApiClient:
     """Async client for Alexa Smart Home GraphQL API.
 
     Uses aiohttp with a semaphore limiting max 2 concurrent requests and a
     65-second request timeout, mirroring the TypeScript implementation in
     src/wrapper/alexa-api-wrapper.ts.
+
+    Requires a full registration_data dict (from AlexaAuthManager) containing
+    localCookie and csrf — mirrors how alexa-remote2 uses localCookie + csrf header.
     """
 
     def __init__(
@@ -514,24 +523,33 @@ class AlexaApiClient:
         amazon_domain: str,
         session: aiohttp.ClientSession,
     ) -> None:
+        self._amazon_domain = amazon_domain
         self._base_url = f"https://alexa.{amazon_domain}"
         self._session = session
         self._semaphore = asyncio.Semaphore(DEFAULT_MAX_CONCURRENT_REQUESTS)
         self._timeout = aiohttp.ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)
-        self._cookie: str | None = None
+        self._local_cookie: str | None = None
+        self._csrf: str | None = None
 
-    def set_cookie(self, cookie: str) -> None:
-        """Update the session cookie used for authentication."""
-        self._cookie = cookie
+    def set_registration_data(self, data: dict) -> None:
+        """Update auth credentials from full registration data dict."""
+        self._local_cookie = data.get("localCookie") or data.get("loginCookie")
+        self._csrf = data.get("csrf")
 
     @property
     def _headers(self) -> dict[str, str]:
         headers = {
             "Content-Type": "application/json",
-            "Accept": "application/json",
+            "Accept": "application/json; charset=utf-8",
+            "User-Agent": _API_USER_AGENT,
+            "Accept-Language": "en-US",
+            "Referer": f"https://alexa.{self._amazon_domain}/spa/index.html",
+            "Origin": f"https://alexa.{self._amazon_domain}",
         }
-        if self._cookie:
-            headers["Cookie"] = self._cookie
+        if self._local_cookie:
+            headers["Cookie"] = self._local_cookie
+        if self._csrf:
+            headers["csrf"] = self._csrf
         return headers
 
     async def _execute_graphql(
