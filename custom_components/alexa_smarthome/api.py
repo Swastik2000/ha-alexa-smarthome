@@ -625,6 +625,42 @@ class AlexaApiClient:
             _LOGGER.warning("Error obtaining Bearer access token: %s", err)
         return None
 
+    async def update_base_url(self) -> None:
+        """Fetch /api/endpoints and update base URL to websiteApiUrl if provided.
+
+        alexa-remote2 calls this on startup — Amazon sometimes returns a
+        different websiteApiUrl (e.g. still alexa.amazon.com for some IN
+        accounts), and device control fails if we call the wrong host.
+        """
+        url = f"{self._base_url}/api/endpoints"
+        headers = {
+            "User-Agent": _API_USER_AGENT,
+            "Accept": "application/json",
+        }
+        if self._local_cookie:
+            headers["Cookie"] = self._local_cookie
+        if self._csrf:
+            headers["csrf"] = self._csrf
+        try:
+            async with self._session.get(url, headers=headers, timeout=self._timeout) as resp:
+                if resp.status == 200:
+                    body = await resp.json(content_type=None)
+                    website_api = body.get("websiteApiUrl")
+                    if website_api:
+                        new_base = website_api.rstrip("/")
+                        if new_base != self._base_url:
+                            _LOGGER.info(
+                                "Alexa base URL updated from %s to %s",
+                                self._base_url, new_base,
+                            )
+                            self._base_url = new_base
+                        else:
+                            _LOGGER.debug("Alexa base URL confirmed: %s", self._base_url)
+                    else:
+                        _LOGGER.debug("/api/endpoints response: %s", body)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Failed to fetch Alexa endpoints: %s", err)
+
     async def refresh_csrf(self) -> None:
         """Fetch a fresh CSRF token from the Alexa /api/language endpoint.
 

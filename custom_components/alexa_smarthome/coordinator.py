@@ -73,6 +73,8 @@ class AlexaDataUpdateCoordinator(DataUpdateCoordinator[dict[str, list[Capability
         Should be called once during config entry setup before the first
         coordinator refresh.
         """
+        # Discover the real Alexa API base URL (may differ from alexa.amazon.in).
+        await self.api.update_base_url()
         # Refresh CSRF token so mutations work (queries can work without it,
         # but state-changing operations require a fresh token).
         await self.api.refresh_csrf()
