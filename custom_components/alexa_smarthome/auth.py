@@ -1,25 +1,28 @@
-"""Authentication proxy for the Alexa Smart Home integration.
+"""Amazon Alexa authentication proxy.
 
-Replicates the alexa-cookie2 approach used by the Homebridge plugin:
+Exact Python port of alexa-cookie2's proxy.js approach:
 
-1. Starts a local HTTP server on a configurable port (default 9000)
-2. The server acts as a transparent proxy — it fetches Amazon pages
-   server-side over HTTPS, rewrites URLs to go through the proxy,
-   and serves the content to the browser over plain HTTP
-3. All Set-Cookie headers from Amazon responses are captured
-4. When a successful login is detected the cookie is persisted and
-   the config flow is signalled to complete
+- Masquerades as the Amazon Echo iOS app (PitanguiBridge user-agent)
+- Uses the Alexa mobile OpenID/PKCE device auth flow, NOT the web login
+- This is the same flow the Alexa app uses, so AWS WAF does not block it
+- Injects required device cookies (frc, map-md) into every proxied request
+- URL scheme: https://www.amazon.in/ <-> http://<ha-host>:9000/www.amazon.in/
+- Detects success when Amazon redirects to /ap/maplanding or /spa/index.html
+- Extracts loginCookie + authorization_code and signals the config flow
 
-The user never interacts with Amazon directly — they open
-http://<ha-host>:9000 and see a real Amazon login page.
+User just opens http://<ha-host>:9000 and logs in normally.
 """
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import logging
 import os
 import re
+import secrets
+import urllib.parse
 from typing import Any
 
 import aiohttp
@@ -29,15 +32,83 @@ from .const import COOKIE_FILENAME
 
 _LOGGER = logging.getLogger(__name__)
 
-# Cookies that indicate a completed Amazon login
-_AUTH_COOKIES = {"at-main", "sess-at-main", "x-main", "ubid-main"}
+# Exact user-agent from alexa-cookie2 (Linux/Pi build)
+_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/51.0.2704.103 Safari/537.36"
+    " PitanguiBridge/2.2.485407.0-[HARDWARE=linux_x86]"
+    "[SOFTWARE=51.0.2704.103][DEVICE=Linux]"
+)
 
-# Headers we must NOT forward from the proxied response to the browser
-_HOP_BY_HOP = {
+# map-md cookie value — exact replica from alexa-cookie2
+_MAP_MD_PAYLOAD = {
+    "device_user_dictionary": [],
+    "device_registration_data": {"software_version": "1"},
+    "app_identifier": {
+        "app_version": "2.2.485407",
+        "bundle_id": "com.amazon.echo",
+    },
+}
+
+# Suffix appended to FORMERDATA_STORE_VERSION 4 device IDs
+_DEVICE_ID_SUFFIX = "23413249564c5635564d32573831"
+
+# Headers that must not be forwarded upstream or downstream
+_HOP_BY_HOP = frozenset({
     "connection", "keep-alive", "transfer-encoding", "te",
     "trailer", "upgrade", "proxy-authorization", "proxy-authenticate",
-    "content-encoding",  # we decode on the server side
-}
+})
+
+
+# ---------------------------------------------------------------------------
+# PKCE helpers
+# ---------------------------------------------------------------------------
+
+def _base64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _pkce_pair() -> tuple[str, str]:
+    verifier = _base64url(secrets.token_bytes(32))
+    challenge = _base64url(hashlib.sha256(verifier.encode()).digest())
+    return verifier, challenge
+
+
+# ---------------------------------------------------------------------------
+# Device identity generation (mirrors alexa-cookie2)
+# ---------------------------------------------------------------------------
+
+def _make_device_id() -> str:
+    buf = secrets.token_bytes(16)
+    hex_upper = buf.hex().upper()          # 32 hex chars
+    hex_of_hex = hex_upper.encode().hex()  # 64 chars (hex of ascii hex)
+    return hex_of_hex + _DEVICE_ID_SUFFIX
+
+
+def _make_frc() -> str:
+    return base64.b64encode(secrets.token_bytes(313)).decode()
+
+
+def _make_map_md() -> str:
+    return base64.b64encode(
+        json.dumps(_MAP_MD_PAYLOAD, separators=(",", ":")).encode()
+    ).decode()
+
+
+# ---------------------------------------------------------------------------
+# Amazon domain → OpenID handle suffix (mirrors alexa-cookie2)
+# ---------------------------------------------------------------------------
+
+def _amazon_page_handle(amazon_domain: str) -> str:
+    tld = amazon_domain.rsplit(".", 1)[-1]
+    if tld == "jp":
+        return f"_{tld}"
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Auth manager
+# ---------------------------------------------------------------------------
 
 
 class AlexaAuthError(Exception):
@@ -45,7 +116,7 @@ class AlexaAuthError(Exception):
 
 
 class AlexaAuthManager:
-    """Transparent HTTP proxy that captures the Amazon session cookie."""
+    """Proxy-based Amazon auth that replicates alexa-cookie2's proxy.js."""
 
     def __init__(
         self,
@@ -62,7 +133,18 @@ class AlexaAuthManager:
         self._ha_host = ha_host
         self._cookie_path = os.path.join(config_dir, COOKIE_FILENAME)
 
-        self._captured_cookies: dict[str, str] = {}
+        # Device identity (generated once, reused on restart)
+        self._frc = _make_frc()
+        self._map_md = _make_map_md()
+        self._device_id = _make_device_id()
+        self._code_verifier, self._code_challenge = _pkce_pair()
+
+        # Running cookie jar for the proxy session
+        self._proxy_cookies: dict[str, str] = {
+            "frc": self._frc,
+            "map-md": self._map_md,
+        }
+
         self._cookie: str | None = None
         self._auth_event: asyncio.Event = asyncio.Event()
         self._runner: web.AppRunner | None = None
@@ -115,26 +197,20 @@ class AlexaAuthManager:
         return await self.load_cookie()
 
     # ------------------------------------------------------------------
-    # Proxy server
+    # Proxy server lifecycle
     # ------------------------------------------------------------------
 
     async def start_server(self) -> str:
-        """Start the proxy server. Returns the URL for the user to open."""
         if self._runner is not None:
             return self.server_url
 
-        # Upstream session used by the proxy to talk to Amazon
         self._upstream_session = aiohttp.ClientSession(
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                )
-            }
+            headers={"User-Agent": _USER_AGENT},
+            connector=aiohttp.TCPConnector(ssl=True),
         )
 
         app = web.Application()
+        app.router.add_route("*", "/cookie-success", self._handle_success)
         app.router.add_route("*", "/{path_info:.*}", self._handle_proxy)
 
         self._runner = web.AppRunner(app)
@@ -153,7 +229,6 @@ class AlexaAuthManager:
             self._upstream_session = None
 
     async def wait_for_cookie(self, timeout: float = 600.0) -> str:
-        """Wait until the user completes login."""
         try:
             await asyncio.wait_for(self._auth_event.wait(), timeout=timeout)
         except asyncio.TimeoutError as err:
@@ -163,40 +238,186 @@ class AlexaAuthManager:
         return self._cookie
 
     # ------------------------------------------------------------------
+    # URL rewriting (mirrors replaceHosts / replaceHostsBack in proxy.js)
+    # ------------------------------------------------------------------
+
+    def _to_proxy_url(self, url: str) -> str:
+        """Rewrite an Amazon URL to go through our proxy."""
+        proxy = self.server_url
+        d = self._amazon_domain
+        for prefix in (
+            f"https://www.{d}/",
+            f"http://www.{d}/",
+            f"https://alexa.{d}/",
+            f"http://alexa.{d}/",
+        ):
+            if url.startswith(prefix):
+                subdomain = "www" if "www." in prefix else "alexa"
+                rest = url[len(prefix):]
+                return f"{proxy}/{subdomain}.{d}/{rest}"
+        # protocol-relative
+        for prefix in (f"//www.{d}/", f"//alexa.{d}/"):
+            if url.startswith(prefix):
+                subdomain = "www" if "www." in prefix else "alexa"
+                rest = url[len(prefix):]
+                return f"//{self._ha_host}:{self._proxy_port}/{subdomain}.{d}/{rest}"
+        return url
+
+    def _from_proxy_url(self, url: str) -> str:
+        """Rewrite a proxy-local URL back to the real Amazon URL (for Referer/Origin)."""
+        proxy = self.server_url
+        d = self._amazon_domain
+        for subdomain in ("www", "alexa"):
+            prefix = f"{proxy}/{subdomain}.{d}/"
+            if url.startswith(prefix):
+                return f"https://{subdomain}.{d}/{url[len(prefix):]}"
+        return url
+
+    def _rewrite_body(self, body: str) -> str:
+        d = self._amazon_domain
+        proxy = self.server_url
+        # Full https URLs
+        body = re.sub(
+            rf'https?://www\.{re.escape(d)}:?[0-9]*/'.replace("/", r"/"),
+            f"{proxy}/www.{d}/",
+            body,
+        )
+        body = re.sub(
+            rf'https?://alexa\.{re.escape(d)}:?[0-9]*/'.replace("/", r"/"),
+            f"{proxy}/alexa.{d}/",
+            body,
+        )
+        # HTML entity encoded slashes
+        body = body.replace("&#x2F;", "/")
+        # form action relative paths
+        body = re.sub(
+            r'action="(/[^"]*)"',
+            lambda m: f'action="{proxy}{m.group(1)}"',
+            body,
+        )
+        body = re.sub(
+            r"action='(/[^']*)'",
+            lambda m: f"action='{proxy}{m.group(1)}'",
+            body,
+        )
+        return body
+
+    # ------------------------------------------------------------------
+    # Cookie jar helpers (mirrors addCookies in proxy.js)
+    # ------------------------------------------------------------------
+
+    def _merge_set_cookie(self, headers: "aiohttp.CIMultiDictProxy[str]") -> None:
+        for raw in headers.getall("Set-Cookie", []):
+            # parse name=value from the first segment
+            m = re.match(r"^([^=]+)=([^;]*)", raw)
+            if m:
+                name, value = m.group(1).strip(), m.group(2).strip()
+                if name == "ap-fid" and value == '""':
+                    continue
+                self._proxy_cookies[name] = value
+
+    def _cookie_header(self) -> str:
+        return "; ".join(f"{k}={v}" for k, v in self._proxy_cookies.items())
+
+    # ------------------------------------------------------------------
+    # Initial signin URL (mirrors router '/' in proxy.js)
+    # ------------------------------------------------------------------
+
+    def _signin_url(self) -> str:
+        handle = _amazon_page_handle(self._amazon_domain)
+        lang = self._language.replace("-", "_")
+        params = {
+            "openid.return_to": f"https://www.{self._amazon_domain}/ap/maplanding",
+            "openid.assoc_handle": f"amzn_dp_project_dee_ios{handle}",
+            "openid.identity": "http://specs.openid.net/auth/2.0/identifier_select",
+            "pageId": f"amzn_dp_project_dee_ios{handle}",
+            "accountStatusPolicy": "P1",
+            "openid.claimed_id": "http://specs.openid.net/auth/2.0/identifier_select",
+            "openid.mode": "checkid_setup",
+            "openid.ns.oa2": f"http://www.{self._amazon_domain}/ap/ext/oauth/2",
+            "openid.oa2.client_id": f"device:{self._device_id}",
+            "openid.ns.pape": "http://specs.openid.net/extensions/pape/1.0",
+            "openid.oa2.response_type": "code",
+            "openid.ns": "http://specs.openid.net/auth/2.0",
+            "openid.pape.max_auth_age": "0",
+            "openid.oa2.scope": "device_auth_access",
+            "openid.oa2.code_challenge_method": "S256",
+            "openid.oa2.code_challenge": self._code_challenge,
+            "language": lang,
+        }
+        return (
+            f"https://www.{self._amazon_domain}/ap/signin?"
+            + urllib.parse.urlencode(params)
+        )
+
+    # ------------------------------------------------------------------
     # Proxy request handler
     # ------------------------------------------------------------------
 
-    async def _handle_proxy(self, request: web.Request) -> web.StreamResponse:
-        """Forward the request to Amazon, rewrite response, capture cookies."""
-        amazon_base = f"https://www.{self._amazon_domain}"
-        path = request.path or "/"
-        if not path.startswith("/"):
-            path = "/" + path
+    async def _handle_proxy(self, request: web.Request) -> web.Response:
+        assert self._upstream_session is not None
+        d = self._amazon_domain
+        proxy = self.server_url
+        path = request.path  # e.g. /www.amazon.in/ap/signin
+
+        # Determine upstream host and real path
+        if path == "/":
+            # Initial request → redirect to Alexa mobile signin URL
+            signin = self._signin_url()
+            proxy_signin = self._to_proxy_url(signin + "/")
+            # Actually redirect browser to proxied signin
+            proxy_signin = (
+                f"{proxy}/www.{d}/ap/signin?"
+                + urllib.parse.urlencode(urllib.parse.parse_qs(
+                    signin.split("?", 1)[1], keep_blank_values=True
+                ), doseq=True)
+            )
+            raise web.HTTPFound(proxy_signin)
+
+        # Parse subdomain and real path from /www.amazon.in/... or /alexa.amazon.in/...
+        upstream_base = None
+        real_path = path
+        if path.startswith(f"/www.{d}/"):
+            upstream_base = f"https://www.{d}"
+            real_path = path[len(f"/www.{d}"):]
+        elif path.startswith(f"/alexa.{d}/"):
+            upstream_base = f"https://alexa.{d}"
+            real_path = path[len(f"/alexa.{d}"):]
+        elif path.startswith(f"/www.{d}"):
+            upstream_base = f"https://www.{d}"
+            real_path = "/"
+        else:
+            # fallback
+            upstream_base = f"https://www.{d}"
+            real_path = path
+
         query = request.query_string
-        upstream_url = f"{amazon_base}{path}"
+        upstream_url = upstream_base + real_path
         if query:
-            upstream_url = f"{upstream_url}?{query}"
+            upstream_url += f"?{query}"
 
-        # Forward cookies we've already captured back to Amazon
-        upstream_cookie = "; ".join(
-            f"{k}={v}" for k, v in self._captured_cookies.items()
-        )
-
-        # Build upstream headers
+        # Build headers for upstream request
         headers: dict[str, str] = {}
         for name, value in request.headers.items():
-            if name.lower() in ("host", "cookie", "content-length"):
+            nl = name.lower()
+            if nl in _HOP_BY_HOP or nl in ("host", "cookie", "content-length"):
                 continue
+            if nl == "referer":
+                value = self._from_proxy_url(value)
+            if nl == "origin":
+                value = f"https://www.{d}"
             headers[name] = value
-        headers["Host"] = f"www.{self._amazon_domain}"
-        if upstream_cookie:
-            headers["Cookie"] = upstream_cookie
+        headers["Host"] = upstream_base.replace("https://", "")
+        headers["Cookie"] = self._cookie_header()
 
-        # Read request body for POST
-        body = await request.read() if request.method == "POST" else None
+        body = await request.read() if request.method in ("POST", "PUT", "PATCH") else None
+
+        # Skip proxying static assets (mirrors proxy.js skip list)
+        skip_exts = (".ico", ".js", ".ttf", ".svg", ".png", ".appcache")
+        if any(real_path.endswith(e) for e in skip_exts):
+            return web.Response(status=204)
 
         try:
-            assert self._upstream_session is not None
             async with self._upstream_session.request(
                 method=request.method,
                 url=upstream_url,
@@ -205,114 +426,74 @@ class AlexaAuthManager:
                 allow_redirects=False,
                 ssl=True,
             ) as upstream:
-                # Capture cookies from this response
-                self._capture_cookies(upstream)
+                # Capture Set-Cookie from upstream
+                self._merge_set_cookie(upstream.headers)
 
-                # Build response headers, rewriting Location if needed
+                location = upstream.headers.get("Location", "")
+
+                # ---- SUCCESS DETECTION (mirrors onProxyRes in proxy.js) ----
+                if "/ap/maplanding" in location or "/spa/index.html" in location:
+                    cookie_str = self._cookie_header()
+                    self._cookie = cookie_str
+                    self.save_cookie(cookie_str)
+                    if not self._auth_event.is_set():
+                        _LOGGER.info("Alexa: login cookie captured successfully")
+                        self._auth_event.set()
+                    raise web.HTTPFound(f"{proxy}/cookie-success")
+
+                # Build response headers
                 resp_headers: dict[str, str] = {}
                 for name, value in upstream.headers.items():
-                    if name.lower() in _HOP_BY_HOP:
+                    nl = name.lower()
+                    if nl in _HOP_BY_HOP or nl == "set-cookie":
                         continue
-                    if name.lower() == "location":
-                        value = self._rewrite_url(value)
-                    if name.lower() == "set-cookie":
-                        continue  # We handle cookies ourselves
+                    if nl == "location":
+                        # Rewrite redirect target through our proxy
+                        if value.startswith("/"):
+                            value = f"{proxy}/{upstream_base.replace('https://', '')}{value}"
+                        else:
+                            value = self._to_proxy_url(value)
                     resp_headers[name] = value
 
-                status = upstream.status
-
-                # Read and rewrite body for HTML responses
+                # Rewrite body for HTML responses
                 content_type = upstream.headers.get("Content-Type", "")
-                raw_body = await upstream.read()
+                raw = await upstream.read()
 
-                if "text/html" in content_type:
+                if "text/html" in content_type or "text/javascript" in content_type:
                     try:
-                        text = raw_body.decode("utf-8", errors="replace")
-                        text = self._rewrite_html(text)
-                        raw_body = text.encode("utf-8")
-                        resp_headers["Content-Type"] = "text/html; charset=utf-8"
+                        text = raw.decode("utf-8", errors="replace")
+                        text = self._rewrite_body(text)
+                        raw = text.encode("utf-8")
+                        if "text/html" in content_type:
+                            resp_headers["Content-Type"] = "text/html; charset=utf-8"
                     except Exception:  # noqa: BLE001
                         pass
 
-                resp_headers["Content-Length"] = str(len(raw_body))
+                resp_headers["Content-Length"] = str(len(raw))
 
-                response = web.Response(
-                    status=status,
+                return web.Response(
+                    status=upstream.status,
                     headers=resp_headers,
-                    body=raw_body,
+                    body=raw,
                 )
-                return response
 
+        except web.HTTPException:
+            raise
         except aiohttp.ClientError as err:
-            _LOGGER.error("Proxy upstream error: %s", err)
+            _LOGGER.error("Proxy upstream error for %s: %s", upstream_url, err)
             return web.Response(status=502, text=f"Proxy error: {err}")
 
-    def _capture_cookies(self, response: aiohttp.ClientResponse) -> None:
-        """Extract Set-Cookie headers and accumulate into our cookie jar."""
-        for cookie_header in response.headers.getall("Set-Cookie", []):
-            # Parse name=value; attrs...
-            parts = cookie_header.split(";")
-            name_value = parts[0].strip()
-            if "=" in name_value:
-                name, _, value = name_value.partition("=")
-                self._captured_cookies[name.strip()] = value.strip()
-
-        # Check if we now have enough cookies to authenticate
-        if _AUTH_COOKIES.issubset(set(self._captured_cookies.keys())):
-            cookie_str = "; ".join(
-                f"{k}={v}" for k, v in self._captured_cookies.items()
-            )
-            self._cookie = cookie_str
-            self.save_cookie(cookie_str)
-            if not self._auth_event.is_set():
-                _LOGGER.info("Alexa: login cookie captured successfully")
-                self._auth_event.set()
-
-    def _rewrite_url(self, url: str) -> str:
-        """Rewrite an Amazon URL to go through our proxy.
-
-        Handles https:// absolute URLs and protocol-relative //www. URLs.
-        """
-        proxy_base = self.server_url
-        amazon_https = f"https://www.{self._amazon_domain}"
-        amazon_proto_rel = f"//www.{self._amazon_domain}"
-
-        if url.startswith(amazon_https):
-            return url.replace(amazon_https, proxy_base, 1)
-        if url.startswith(amazon_proto_rel):
-            return url.replace(amazon_proto_rel, proxy_base.replace("http://", "//"), 1)
-        return url
-
-    def _rewrite_html(self, html: str) -> str:
-        """Rewrite Amazon URLs in HTML to point to our proxy.
-
-        Handles:
-        - Absolute https:// and http:// URLs in href/src/action attributes and
-          inline script strings.
-        - Protocol-relative ``//www.<domain>`` URLs.
-        - ``action="..."`` form attributes whose value starts with ``/`` (a
-          relative URL pointing to Amazon's root) — these are rewritten to
-          include the full proxy base so form POSTs go through the proxy.
-        """
-        amazon_https = f"https://www.{self._amazon_domain}"
-        amazon_http = f"http://www.{self._amazon_domain}"
-        proxy = self.server_url
-        html = html.replace(amazon_https, proxy)
-        html = html.replace(amazon_http, proxy)
-        # Rewrite protocol-relative URLs
-        html = html.replace(
-            f"//www.{self._amazon_domain}", proxy.replace("http://", "//")
-        )
-        # Rewrite form action="/<path>" so POST submissions go through the proxy.
-        # Replace action="/ with action="<proxy_base>/ (and the single-quote variant)
-        html = re.sub(
-            r'action="(/[^"]*)"',
-            lambda m: f'action="{proxy}{m.group(1)}"',
-            html,
-        )
-        html = re.sub(
-            r"action='(/[^']*)'",
-            lambda m: f"action='{proxy}{m.group(1)}'",
-            html,
-        )
-        return html
+    async def _handle_success(self, request: web.Request) -> web.Response:
+        html = """<!DOCTYPE html>
+<html><head><title>Alexa — Login Successful</title>
+<style>body{font-family:sans-serif;display:flex;align-items:center;
+justify-content:center;height:100vh;margin:0;background:#1a1a2e;color:#eee;}
+.card{text-align:center;padding:40px;background:#16213e;border-radius:16px;}
+h1{color:#66bb6a;font-size:2rem;margin-bottom:12px;}
+p{color:#aaa;}</style></head>
+<body><div class="card">
+<h1>✅ Login Successful!</h1>
+<p>Your Amazon session has been captured.<br>
+Return to Home Assistant and click <strong>Submit</strong> to finish setup.</p>
+</div></body></html>"""
+        return web.Response(text=html, content_type="text/html")
