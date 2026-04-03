@@ -273,7 +273,7 @@ class AlexaAuthManager:
     def _to_proxy_url(self, url: str) -> str:
         """Rewrite an Amazon URL to go through our proxy."""
         proxy = self.server_url
-        d = self._amazon_domain
+        d = _BASE_AMAZON_PAGE  # proxy always routes through amazon.com
         for prefix in (
             f"https://www.{d}/",
             f"http://www.{d}/",
@@ -295,7 +295,7 @@ class AlexaAuthManager:
     def _from_proxy_url(self, url: str) -> str:
         """Rewrite a proxy-local URL back to the real Amazon URL (for Referer/Origin)."""
         proxy = self.server_url
-        d = self._amazon_domain
+        d = _BASE_AMAZON_PAGE  # proxy always routes through amazon.com
         for subdomain in ("www", "alexa"):
             prefix = f"{proxy}/{subdomain}.{d}/"
             if url.startswith(prefix):
@@ -303,7 +303,7 @@ class AlexaAuthManager:
         return url
 
     def _rewrite_body(self, body: str) -> str:
-        d = self._amazon_domain
+        d = _BASE_AMAZON_PAGE  # proxy always routes through amazon.com
         proxy = self.server_url
         # Full https URLs
         body = re.sub(
@@ -352,17 +352,22 @@ class AlexaAuthManager:
     # ------------------------------------------------------------------
 
     def _signin_url(self) -> str:
-        handle = _amazon_page_handle(self._amazon_domain)
+        # alexa-cookie2 always uses baseAmazonPage (= amazon.com) for the proxy
+        # signin URL — the amzn_dp_project_dee_ios flow only works on amazon.com.
+        # The user's country domain (amazon.in etc.) is only used AFTER auth for
+        # the token exchange step.
+        d = _BASE_AMAZON_PAGE
+        handle = _amazon_page_handle(d)
         lang = self._language.replace("-", "_")
         params = {
-            "openid.return_to": f"https://www.{self._amazon_domain}/ap/maplanding",
+            "openid.return_to": f"https://www.{d}/ap/maplanding",
             "openid.assoc_handle": f"amzn_dp_project_dee_ios{handle}",
             "openid.identity": "http://specs.openid.net/auth/2.0/identifier_select",
             "pageId": f"amzn_dp_project_dee_ios{handle}",
             "accountStatusPolicy": "P1",
             "openid.claimed_id": "http://specs.openid.net/auth/2.0/identifier_select",
             "openid.mode": "checkid_setup",
-            "openid.ns.oa2": f"http://www.{self._amazon_domain}/ap/ext/oauth/2",
+            "openid.ns.oa2": f"http://www.{d}/ap/ext/oauth/2",
             "openid.oa2.client_id": f"device:{self._device_id}",
             "openid.ns.pape": "http://specs.openid.net/extensions/pape/1.0",
             "openid.oa2.response_type": "code",
@@ -374,7 +379,7 @@ class AlexaAuthManager:
             "language": lang,
         }
         return (
-            f"https://www.{self._amazon_domain}/ap/signin?"
+            f"https://www.{d}/ap/signin?"
             + urllib.parse.urlencode(params)
         )
 
@@ -624,7 +629,7 @@ class AlexaAuthManager:
 
     async def _handle_proxy(self, request: web.Request) -> web.Response:
         assert self._upstream_session is not None
-        d = self._amazon_domain
+        d = _BASE_AMAZON_PAGE  # proxy always routes through amazon.com
         proxy = self.server_url
         path = request.path  # e.g. /www.amazon.in/ap/signin
 
@@ -673,7 +678,12 @@ class AlexaAuthManager:
         headers: dict[str, str] = {}
         for name, value in request.headers.items():
             nl = name.lower()
-            if nl in _HOP_BY_HOP or nl in ("host", "cookie", "content-length"):
+            if nl in _HOP_BY_HOP or nl in (
+                "host", "cookie", "content-length",
+                # Strip Accept-Encoding so Amazon returns uncompressed HTML.
+                # We rewrite body content in-flight; gzip bytes would corrupt it.
+                "accept-encoding",
+            ):
                 continue
             if nl == "referer":
                 value = self._from_proxy_url(value)
@@ -739,7 +749,7 @@ class AlexaAuthManager:
                 resp_headers: dict[str, str] = {}
                 for name, value in upstream.headers.items():
                     nl = name.lower()
-                    if nl in _HOP_BY_HOP or nl == "set-cookie":
+                    if nl in _HOP_BY_HOP or nl in ("set-cookie", "content-encoding"):
                         continue
                     if nl == "location":
                         # Rewrite redirect target through our proxy
