@@ -743,6 +743,71 @@ class AlexaApiClient:
 
         return _extract_states(features)
 
+    async def _set_device_state_rest(
+        self,
+        entity_id: str,
+        operation_name: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Control a device via the legacy PUT /api/phoenix/state REST endpoint.
+
+        This is the same API used by the Alexa app and alexa-remote2's
+        executeSmarthomeDeviceAction(). It is more reliable than the GraphQL
+        setEndpointFeatures mutation for third-party skill devices.
+
+        Args:
+            entity_id: Short device UUID (without 'amzn1.alexa.endpoint.' prefix).
+            operation_name: Alexa action name, e.g. 'turnOn', 'turnOff'.
+            payload: Optional extra parameters merged into the action parameters.
+        """
+        parameters: dict[str, Any] = {"action": operation_name}
+        if payload:
+            parameters.update(payload)
+
+        body = {
+            "controlRequests": [
+                {
+                    "entityId": entity_id,
+                    "entityType": "APPLIANCE",
+                    "parameters": parameters,
+                }
+            ]
+        }
+
+        url = f"{self._base_url}/api/phoenix/state"
+        try:
+            async with self._session.put(
+                url,
+                json=body,
+                headers=self._headers,
+                timeout=self._timeout,
+            ) as response:
+                if response.status == 401:
+                    raise AlexaAuthError(
+                        "Authentication failed (401). Re-authentication required."
+                    )
+                if response.status == 403:
+                    raise AlexaAuthError(
+                        "Access denied (403). Check your session cookie."
+                    )
+                response.raise_for_status()
+                data: dict[str, Any] = await response.json(content_type=None)
+        except aiohttp.ClientResponseError as err:
+            raise AlexaApiError(
+                f"HTTP error {err.status} calling /api/phoenix/state: {err.message}"
+            ) from err
+        except asyncio.TimeoutError as err:
+            raise AlexaApiError("Timeout waiting for /api/phoenix/state response") from err
+        except aiohttp.ClientError as err:
+            raise AlexaApiError(f"Network error calling /api/phoenix/state: {err}") from err
+
+        errors = data.get("errors") or []
+        if errors:
+            _LOGGER.error("/api/phoenix/state errors for %s: %s", entity_id, errors)
+            raise AlexaApiError(f"/api/phoenix/state failed: {errors}")
+
+        _LOGGER.debug("/api/phoenix/state success for %s: %s", entity_id, data.get("controlResponses"))
+
     async def set_device_state(
         self,
         endpoint_id: str,
@@ -750,9 +815,12 @@ class AlexaApiClient:
         operation_name: str,
         payload: dict[str, Any] | None = None,
     ) -> None:
-        """Execute a SetEndpointFeatures GraphQL mutation.
+        """Control a device via GraphQL mutation, falling back to REST if the
+        device is reported offline by the GraphQL API.
 
-        Mirrors setDeviceStateGraphQl() from AlexaApiWrapper.
+        Some third-party skill devices (especially in non-US regions) return
+        DEVICE_OFFLINE from setEndpointFeatures even though they respond fine
+        via the legacy /api/phoenix/state REST endpoint used by the Alexa app.
         """
         _LOGGER.debug(
             "set_device_state: endpointId=%s featureName=%s operationName=%s payload=%s",
@@ -772,26 +840,38 @@ class AlexaApiClient:
             variables={"featureControlRequests": [request]},
         )
 
-        result = (response.get("data") or {}).get("setEndpointFeatures") or {}
-        gql_errors = result.get("errors") or []
-        if gql_errors:
-            _LOGGER.error(
-                "setEndpointFeatures returned errors for %s: %s", endpoint_id, gql_errors
-            )
-            raise AlexaApiError(
-                f"setEndpointFeatures failed: {gql_errors}"
-            )
-
-        responses = result.get("featureControlResponses") or []
-        _LOGGER.debug("setEndpointFeatures success: %s", responses)
-
-        # Also surface top-level GraphQL errors (e.g. auth, schema errors)
+        # Surface top-level GraphQL errors (auth / schema issues)
         top_errors = response.get("errors")
         if top_errors:
             _LOGGER.error(
                 "GraphQL top-level errors for %s: %s", endpoint_id, top_errors
             )
             raise AlexaApiError(f"GraphQL errors: {top_errors}")
+
+        result = (response.get("data") or {}).get("setEndpointFeatures") or {}
+        gql_errors = result.get("errors") or []
+
+        if gql_errors:
+            error_codes = {e.get("code") for e in gql_errors}
+            if "DEVICE_OFFLINE" in error_codes:
+                # GraphQL reports device offline — fall back to the REST API
+                # which is used by the Alexa app and works for third-party skills.
+                _LOGGER.debug(
+                    "setEndpointFeatures returned DEVICE_OFFLINE for %s; "
+                    "falling back to /api/phoenix/state REST API",
+                    endpoint_id,
+                )
+                short_id = endpoint_id.replace("amzn1.alexa.endpoint.", "")
+                await self._set_device_state_rest(short_id, operation_name, payload)
+                return
+
+            _LOGGER.error(
+                "setEndpointFeatures returned errors for %s: %s", endpoint_id, gql_errors
+            )
+            raise AlexaApiError(f"setEndpointFeatures failed: {gql_errors}")
+
+        responses = result.get("featureControlResponses") or []
+        _LOGGER.debug("setEndpointFeatures success: %s", responses)
 
 
 def _is_homebridge_skill_device(endpoint_reports: list[dict[str, Any]]) -> bool:
