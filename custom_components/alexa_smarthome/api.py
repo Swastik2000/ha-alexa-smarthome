@@ -310,11 +310,22 @@ AIR_QUALITY_QUERY = """query getAirQualityStates(
   }
 }"""
 
-SET_ENDPOINT_FEATURES = """mutation SetEndpointFeatures(
+SET_ENDPOINT_FEATURES = """mutation updatePowerFeatureForEndpoints(
   $featureControlRequests: [FeatureControlRequest!]!
 ) {
-  setEndpointFeatures(featureControlRequests: $featureControlRequests) {
-    result
+  setEndpointFeatures(
+    setEndpointFeaturesInput: {
+      featureControlRequests: $featureControlRequests
+    }
+  ) {
+    featureControlResponses {
+      endpointId
+      featureOperationName
+    }
+    errors {
+      endpointId
+      code
+    }
   }
 }"""
 
