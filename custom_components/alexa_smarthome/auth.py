@@ -684,6 +684,9 @@ class AlexaAuthManager:
         headers["Cookie"] = self._cookie_header()
         headers["Accept-Language"] = self._language
         headers["authority"] = f"www.{d}"
+        # Always force the iOS UA — never forward the browser's Chrome UA.
+        # Amazon WAF returns 404 for non-iOS user-agents on the dee_ios auth endpoint.
+        headers["User-Agent"] = _PROXY_USER_AGENT
 
         body = await request.read() if request.method in ("POST", "PUT", "PATCH") else None
 
