@@ -1,7 +1,8 @@
 """Sensor platform for Alexa Smart Home.
 
 Creates separate sensor entities for each sensor capability of a device:
-temperature, humidity, carbon monoxide level, and air quality index.
+temperature, humidity, carbon monoxide level, air quality index, PM2.5, and
+volatile organic compounds (VOC).
 
 Covers AIR_QUALITY_MONITOR and ALEXA_VOICE_ENABLED device types, and also
 exposes temperature/humidity from THERMOSTAT devices.
@@ -18,6 +19,7 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
+    CONCENTRATION_MICROGRAMS_PER_CUBIC_METER,
     CONCENTRATION_PARTS_PER_MILLION,
     PERCENTAGE,
     UnitOfTemperature,
@@ -28,13 +30,17 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import (
     FEATURE_RANGE,
     FEATURE_TEMPERATURE_SENSOR,
-    RANGE_FEATURE_AIR_QUALITY_NAMES,
-    RANGE_FEATURE_CO_NAMES,
-    RANGE_FEATURE_HUMIDITY_NAMES,
+    RANGE_FEATURE_AIR_QUALITY_SUBSTRINGS,
+    RANGE_FEATURE_CO_SUBSTRINGS,
+    RANGE_FEATURE_HUMIDITY_SUBSTRINGS,
+    RANGE_FEATURE_PM25_SUBSTRINGS,
+    RANGE_FEATURE_VOC_SUBSTRINGS,
     SENSOR_TYPE_AIR_QUALITY,
     SENSOR_TYPE_CO,
     SENSOR_TYPE_HUMIDITY,
+    SENSOR_TYPE_PM25,
     SENSOR_TYPE_TEMPERATURE,
+    SENSOR_TYPE_VOC,
     TEMP_SCALE_FAHRENHEIT,
 )
 from .coordinator import AlexaDataUpdateCoordinator
@@ -56,8 +62,41 @@ def _celsius_from_alexa(value_obj: Any) -> float | None:
     if not isinstance(raw, (int, float)):
         return None
     if scale == TEMP_SCALE_FAHRENHEIT:
-        return (raw - 32) * 5 / 9
+        return round((raw - 32) * 5 / 9, 1)
     return float(raw)
+
+
+def _match_range_feature(friendly_name: str) -> str | None:
+    """Return a SENSOR_TYPE_* constant for a range feature friendly name.
+
+    Uses case-insensitive substring matching to handle Alexa's inconsistent
+    phrasing across device firmware versions and locales.  Returns None if the
+    name does not match any known sensor type.
+
+    Spec variants handled:
+    - humidity: "Indoor humidity", "Humidity"
+    - CO: "Carbon Monoxide", "CO"
+    - air quality: "Air Quality", "AQI"
+    - PM2.5: "Particulate matter", "Particulate", "PM2.5", "PM25"
+    - VOC: "Volatile organic compounds", "VOC"
+    """
+    name_lower = friendly_name.lower()
+    for substr in RANGE_FEATURE_HUMIDITY_SUBSTRINGS:
+        if substr in name_lower:
+            return SENSOR_TYPE_HUMIDITY
+    for substr in RANGE_FEATURE_CO_SUBSTRINGS:
+        if substr in name_lower:
+            return SENSOR_TYPE_CO
+    for substr in RANGE_FEATURE_AIR_QUALITY_SUBSTRINGS:
+        if substr in name_lower:
+            return SENSOR_TYPE_AIR_QUALITY
+    for substr in RANGE_FEATURE_PM25_SUBSTRINGS:
+        if substr in name_lower:
+            return SENSOR_TYPE_PM25
+    for substr in RANGE_FEATURE_VOC_SUBSTRINGS:
+        if substr in name_lower:
+            return SENSOR_TYPE_VOC
+    return None
 
 
 async def async_setup_entry(
@@ -73,7 +112,8 @@ async def async_setup_entry(
         if device.device_type not in _SENSOR_DEVICE_TYPES:
             continue
 
-        # Always create a temperature sensor for devices with temperatureSensor
+        # Always create a temperature sensor for devices with temperatureSensor feature.
+        # ALEXA_VOICE_ENABLED devices (Echo devices) use the "temperatureSensor" feature.
         states = coordinator.data.get(device.endpoint_id, []) if coordinator.data else []
         has_temp = any(s.feature_name == FEATURE_TEMPERATURE_SENSOR for s in states)
         if has_temp:
@@ -81,29 +121,22 @@ async def async_setup_entry(
                 AlexaSensorEntity(coordinator, device, SENSOR_TYPE_TEMPERATURE)
             )
 
-        # Create range-based sensors based on the device's range features
+        # Create range-based sensors based on the device's range features.
+        # Uses substring matching so we handle all spec-listed name variants.
         for rf in device.range_features:
-            fn = rf.friendly_name
-            if fn in RANGE_FEATURE_HUMIDITY_NAMES:
+            sensor_type = _match_range_feature(rf.friendly_name)
+            if sensor_type is not None:
                 entities.append(
                     AlexaSensorEntity(
-                        coordinator, device, SENSOR_TYPE_HUMIDITY,
-                        range_instance=rf.instance, range_name=fn,
+                        coordinator, device, sensor_type,
+                        range_instance=rf.instance, range_name=rf.friendly_name,
                     )
                 )
-            elif fn in RANGE_FEATURE_CO_NAMES:
-                entities.append(
-                    AlexaSensorEntity(
-                        coordinator, device, SENSOR_TYPE_CO,
-                        range_instance=rf.instance, range_name=fn,
-                    )
-                )
-            elif fn in RANGE_FEATURE_AIR_QUALITY_NAMES:
-                entities.append(
-                    AlexaSensorEntity(
-                        coordinator, device, SENSOR_TYPE_AIR_QUALITY,
-                        range_instance=rf.instance, range_name=fn,
-                    )
+            else:
+                _LOGGER.debug(
+                    "Unrecognised range feature '%s' on device %s — skipping",
+                    rf.friendly_name,
+                    device.display_name,
                 )
 
     async_add_entities(entities)
@@ -159,6 +192,16 @@ class AlexaSensorEntity(AlexaSmartHomeEntity, SensorEntity):
             self._attr_device_class = SensorDeviceClass.AQI
             self._attr_state_class = SensorStateClass.MEASUREMENT
             self._attr_native_unit_of_measurement = None
+        elif sensor_type == SENSOR_TYPE_PM25:
+            self._attr_name = f"{self._device.display_name} PM2.5"
+            self._attr_device_class = SensorDeviceClass.PM25
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+            self._attr_native_unit_of_measurement = CONCENTRATION_MICROGRAMS_PER_CUBIC_METER
+        elif sensor_type == SENSOR_TYPE_VOC:
+            self._attr_name = f"{self._device.display_name} VOC"
+            self._attr_device_class = SensorDeviceClass.VOLATILE_ORGANIC_COMPOUNDS
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+            self._attr_native_unit_of_measurement = CONCENTRATION_MICROGRAMS_PER_CUBIC_METER
         else:
             self._attr_name = f"{self._device.display_name} Sensor"
             self._attr_device_class = None
@@ -174,7 +217,7 @@ class AlexaSensorEntity(AlexaSmartHomeEntity, SensorEntity):
                 return None
             return _celsius_from_alexa(state.value)
 
-        # Range-based sensors (humidity, CO, air quality)
+        # Range-based sensors (humidity, CO, air quality, PM2.5, VOC)
         if self._range_instance:
             state = self._get_state(
                 FEATURE_RANGE, instance=self._range_instance

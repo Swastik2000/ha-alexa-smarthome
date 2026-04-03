@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import urlparse
 
 import voluptuous as vol
 
@@ -33,6 +34,8 @@ from .const import (
     DEFAULT_LANGUAGE,
     DEFAULT_PROXY_PORT,
     DOMAIN,
+    PROXY_PORT_MAX,
+    PROXY_PORT_MIN,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -49,7 +52,7 @@ STEP_USER_SCHEMA = vol.Schema(
             TextSelectorConfig(type=TextSelectorType.TEXT)
         ),
         vol.Required(CONF_PROXY_PORT, default=DEFAULT_PROXY_PORT): NumberSelector(
-            NumberSelectorConfig(min=1024, max=65535, mode=NumberSelectorMode.BOX)
+            NumberSelectorConfig(min=PROXY_PORT_MIN, max=PROXY_PORT_MAX, mode=NumberSelectorMode.BOX)
         ),
         vol.Required(CONF_CACHE_TTL, default=DEFAULT_CACHE_TTL): NumberSelector(
             NumberSelectorConfig(min=30, max=3600, mode=NumberSelectorMode.BOX)
@@ -100,13 +103,13 @@ class AlexaSmartHomeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         # Initialise the auth manager once
         if self._auth_manager is None:
+            ha_host = _extract_hostname(self.hass.config.external_url)
             self._auth_manager = AlexaAuthManager(
                 config_dir=self.hass.config.config_dir,
                 amazon_domain=self._config[CONF_AMAZON_DOMAIN],
                 language=self._config[CONF_LANGUAGE],
                 proxy_port=self._config[CONF_PROXY_PORT],
-                ha_host=self.hass.config.external_url
-                        or "homeassistant.local",
+                ha_host=ha_host,
             )
             # Reuse a previously saved cookie if available
             existing = await self._auth_manager.load_cookie()
@@ -148,3 +151,24 @@ class AlexaSmartHomeConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._config = dict(entry_data)
         self._auth_manager = None
         return await self.async_step_auth()
+
+
+def _extract_hostname(url: str | None) -> str:
+    """Extract the bare hostname from a URL string.
+
+    ``hass.config.external_url`` returns a full URL such as
+    ``https://homeassistant.local:8123``.  AlexaAuthManager needs only the
+    hostname portion (e.g. ``homeassistant.local``) so users can open
+    ``http://<hostname>:<proxy_port>`` in their browser.
+
+    Falls back to ``homeassistant.local`` if parsing fails or if no URL is
+    configured.
+    """
+    if not url:
+        return "homeassistant.local"
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname  # strips port and scheme
+        return hostname or "homeassistant.local"
+    except Exception:  # noqa: BLE001
+        return "homeassistant.local"

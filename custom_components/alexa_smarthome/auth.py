@@ -269,26 +269,50 @@ class AlexaAuthManager:
                 self._auth_event.set()
 
     def _rewrite_url(self, url: str) -> str:
-        """Rewrite an Amazon URL to go through our proxy."""
-        amazon_base = f"https://www.{self._amazon_domain}"
+        """Rewrite an Amazon URL to go through our proxy.
+
+        Handles https:// absolute URLs and protocol-relative //www. URLs.
+        """
         proxy_base = self.server_url
-        if url.startswith(amazon_base):
-            return url.replace(amazon_base, proxy_base, 1)
-        if url.startswith(f"https://www.{self._amazon_domain}"):
-            return url.replace(
-                f"https://www.{self._amazon_domain}", proxy_base, 1
-            )
+        amazon_https = f"https://www.{self._amazon_domain}"
+        amazon_proto_rel = f"//www.{self._amazon_domain}"
+
+        if url.startswith(amazon_https):
+            return url.replace(amazon_https, proxy_base, 1)
+        if url.startswith(amazon_proto_rel):
+            return url.replace(amazon_proto_rel, proxy_base.replace("http://", "//"), 1)
         return url
 
     def _rewrite_html(self, html: str) -> str:
-        """Rewrite Amazon URLs in HTML to point to our proxy."""
+        """Rewrite Amazon URLs in HTML to point to our proxy.
+
+        Handles:
+        - Absolute https:// and http:// URLs in href/src/action attributes and
+          inline script strings.
+        - Protocol-relative ``//www.<domain>`` URLs.
+        - ``action="..."`` form attributes whose value starts with ``/`` (a
+          relative URL pointing to Amazon's root) — these are rewritten to
+          include the full proxy base so form POSTs go through the proxy.
+        """
         amazon_https = f"https://www.{self._amazon_domain}"
         amazon_http = f"http://www.{self._amazon_domain}"
         proxy = self.server_url
         html = html.replace(amazon_https, proxy)
         html = html.replace(amazon_http, proxy)
-        # Also rewrite protocol-relative URLs
+        # Rewrite protocol-relative URLs
         html = html.replace(
             f"//www.{self._amazon_domain}", proxy.replace("http://", "//")
+        )
+        # Rewrite form action="/<path>" so POST submissions go through the proxy.
+        # Replace action="/ with action="<proxy_base>/ (and the single-quote variant)
+        html = re.sub(
+            r'action="(/[^"]*)"',
+            lambda m: f'action="{proxy}{m.group(1)}"',
+            html,
+        )
+        html = re.sub(
+            r"action='(/[^']*)'",
+            lambda m: f"action='{proxy}{m.group(1)}'",
+            html,
         )
         return html

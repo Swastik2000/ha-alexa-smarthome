@@ -21,6 +21,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
+    FEATURE_POWER,
     FEATURE_TEMPERATURE_SENSOR,
     FEATURE_THERMOSTAT,
     OPERATION_SET_TARGET_SETPOINT,
@@ -133,7 +134,18 @@ class AlexaClimateEntity(AlexaSmartHomeEntity, ClimateEntity):
 
     @property
     def hvac_mode(self) -> HVACMode | None:
-        """Return current HVAC mode."""
+        """Return current HVAC mode.
+
+        If the device exposes a power feature and it is OFF, return
+        HVACMode.OFF regardless of the thermostat mode state.  This mirrors
+        the behaviour in thermostat-accessory.ts where a powered-off device is
+        always reported as OFF.
+        """
+        # Check power feature first — device physically off overrides mode
+        power_state = self._get_state(FEATURE_POWER)
+        if power_state is not None and power_state.value == "OFF":
+            return HVACMode.OFF
+
         state = self._get_state(FEATURE_THERMOSTAT, name="thermostatMode")
         if state is None or not isinstance(state.value, str):
             return None
@@ -188,11 +200,31 @@ class AlexaClimateEntity(AlexaSmartHomeEntity, ClimateEntity):
         return (high + low) / 2
 
     def _get_temp_scale(self) -> str:
-        """Return the Alexa temperature scale from the current temp sensor state."""
+        """Return the Alexa temperature scale for outbound setpoint commands.
+
+        The scale is read from the current thermostat setpoint state (e.g.
+        ``targetSetpoint``, ``upperSetpoint``, or ``lowerSetpoint``), which
+        directly reflects how the thermostat reports temperatures.  Falls back
+        to the temperature sensor scale, then CELSIUS as a last resort.
+
+        Mirrors the scale-detection logic in thermostat-accessory.ts.
+        """
+        # Prefer the scale embedded in the thermostat setpoint states
+        for prop_name in ("targetSetpoint", "upperSetpoint", "lowerSetpoint"):
+            state = self._get_state(FEATURE_THERMOSTAT, name=prop_name)
+            if state is not None and isinstance(state.value, dict):
+                scale = (state.value.get("scale") or "").upper()
+                if scale in (TEMP_SCALE_CELSIUS, TEMP_SCALE_FAHRENHEIT):
+                    return scale
+
+        # Fall back to the ambient temperature sensor scale
         state = self._get_state(FEATURE_TEMPERATURE_SENSOR)
-        if state is None or not isinstance(state.value, dict):
-            return TEMP_SCALE_CELSIUS
-        return (state.value.get("scale") or TEMP_SCALE_CELSIUS).upper()
+        if state is not None and isinstance(state.value, dict):
+            scale = (state.value.get("scale") or "").upper()
+            if scale in (TEMP_SCALE_CELSIUS, TEMP_SCALE_FAHRENHEIT):
+                return scale
+
+        return TEMP_SCALE_CELSIUS
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set the thermostat HVAC mode.

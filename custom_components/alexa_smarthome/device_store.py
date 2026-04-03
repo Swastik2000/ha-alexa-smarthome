@@ -17,9 +17,9 @@ class DeviceStore:
     """In-memory cache of device capability states with TTL.
 
     Mirrors the DeviceStore class from device-store.ts.  States are keyed by
-    device ID, and the cache records a single ``last_updated`` timestamp for
-    the entire store.  A cache is considered "fresh" if it was last updated
-    within ``cache_ttl`` seconds.
+    device ID.  Each device has its own ``last_updated`` timestamp so that
+    isCacheFresh() can be checked per-device, matching the TypeScript
+    implementation exactly.
     """
 
     def __init__(self, cache_ttl: int = 60) -> None:
@@ -32,6 +32,9 @@ class DeviceStore:
         self._cache_ttl = cache_ttl
         # Maps device_id -> list[CapabilityState]
         self._states: dict[str, list[CapabilityState]] = {}
+        # Per-device last-updated timestamps (time.monotonic())
+        self._device_timestamps: dict[str, float] = {}
+        # Global last_updated kept for backward-compatibility
         self._last_updated: float = 0.0
 
     @property
@@ -41,19 +44,36 @@ class DeviceStore:
 
     @property
     def last_updated(self) -> float:
-        """Return the Unix timestamp of the last cache update."""
+        """Return the monotonic timestamp of the last cache update (any device)."""
         return self._last_updated
 
     def is_cache_fresh(self) -> bool:
-        """Return True if the cache was updated within the TTL window."""
+        """Return True if the global cache was updated within the TTL window.
+
+        Deprecated in favour of isCacheFresh(device_id) for per-device checks.
+        Kept for backward compatibility.
+        """
         return (time.monotonic() - self._last_updated) < self._cache_ttl
+
+    def isCacheFresh(self, device_id: str) -> bool:  # noqa: N802 — matches TS name
+        """Return True if the per-device cache was updated within the TTL window.
+
+        Mirrors isCacheFresh() from device-store.ts.  A device that has never
+        been fetched is considered stale (returns False).
+        """
+        ts = self._device_timestamps.get(device_id)
+        if ts is None:
+            return False
+        return (time.monotonic() - ts) < self._cache_ttl
 
     def update_states(
         self, device_id: str, states: list[CapabilityState]
     ) -> None:
         """Replace the cached states for a single device and update the timestamp."""
+        now = time.monotonic()
         self._states[device_id] = states
-        self._last_updated = time.monotonic()
+        self._device_timestamps[device_id] = now
+        self._last_updated = now
 
     def get_states(self, device_id: str) -> list[CapabilityState]:
         """Return the cached states for a device, or an empty list."""

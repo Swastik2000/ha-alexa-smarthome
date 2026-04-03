@@ -93,11 +93,59 @@ class AlexaSmartHomeEntity(CoordinatorEntity[AlexaDataUpdateCoordinator]):
         feature_name: str,
         operation_name: str,
         payload: dict[str, Any] | None = None,
+        optimistic_state: "CapabilityState | None" = None,
     ) -> None:
-        """Execute a state mutation and update the local cache optimistically."""
+        """Execute a state mutation and update the local cache optimistically.
+
+        After a successful API call the coordinator's cached data is updated
+        in-place so that HA reflects the new state immediately without waiting
+        for the next polling cycle.  ``async_write_ha_state()`` is called to
+        push the change to the HA state machine straight away.
+
+        Args:
+            feature_name: The Alexa feature to mutate (e.g. ``"power"``).
+            operation_name: The Alexa operation to invoke (e.g. ``"turnOn"``).
+            payload: Optional payload dict for the GraphQL mutation.
+            optimistic_state: If provided, write this CapabilityState into the
+                coordinator data cache immediately after a successful API call.
+        """
         await self.coordinator.api.set_device_state(
             self._device.endpoint_id,
             feature_name,
             operation_name,
             payload,
         )
+
+        if optimistic_state is not None:
+            # Update the device store so isCacheFresh() and fallback logic work
+            self.coordinator.device_store.update_state_value(
+                self._device.endpoint_id, optimistic_state
+            )
+
+            # Mirror the change into the coordinator's live data dict so that
+            # HA property reads see the new value immediately.
+            if self.coordinator.data is not None:
+                device_states = self.coordinator.data.get(
+                    self._device.endpoint_id, []
+                )
+                updated = False
+                for cached in device_states:
+                    if (
+                        cached.feature_name == optimistic_state.feature_name
+                        and (
+                            optimistic_state.name is None
+                            or cached.name == optimistic_state.name
+                        )
+                        and (
+                            optimistic_state.instance is None
+                            or cached.instance == optimistic_state.instance
+                        )
+                    ):
+                        cached.value = optimistic_state.value
+                        updated = True
+                        break
+                if not updated:
+                    device_states.append(optimistic_state)
+                    self.coordinator.data[self._device.endpoint_id] = device_states
+
+            self.async_write_ha_state()

@@ -16,6 +16,8 @@ CONF_COOKIE = "cookie"
 DEFAULT_AMAZON_DOMAIN = "amazon.com"
 DEFAULT_LANGUAGE = "en-US"
 DEFAULT_PROXY_PORT = 9000
+PROXY_PORT_MIN = 7000
+PROXY_PORT_MAX = 9999
 DEFAULT_CACHE_TTL = 60  # seconds
 DEFAULT_UPDATE_INTERVAL = 30  # seconds
 DEFAULT_REQUEST_TIMEOUT = 65  # seconds
@@ -121,8 +123,19 @@ SENSOR_TYPE_TEMPERATURE = "temperature"
 SENSOR_TYPE_HUMIDITY = "humidity"
 SENSOR_TYPE_CO = "carbon_monoxide"
 SENSOR_TYPE_AIR_QUALITY = "air_quality"
+SENSOR_TYPE_PM25 = "pm25"
+SENSOR_TYPE_VOC = "voc"
 
-# Range feature friendly names that map to sensor types
+# Range feature friendly name substrings that map to sensor types.
+# Matching is done case-insensitively as a substring check (not exact match)
+# to handle Alexa's inconsistent capitalisation and phrasing across locales.
+RANGE_FEATURE_HUMIDITY_SUBSTRINGS = ("humidity", "indoor humidity")
+RANGE_FEATURE_CO_SUBSTRINGS = ("carbon monoxide", " co")
+RANGE_FEATURE_AIR_QUALITY_SUBSTRINGS = ("air quality", "aqi")
+RANGE_FEATURE_PM25_SUBSTRINGS = ("particulate matter", "particulate", "pm2.5", "pm25")
+RANGE_FEATURE_VOC_SUBSTRINGS = ("volatile organic", "voc")
+
+# Kept for backward-compatibility (exact-match sets used by old sensor.py)
 RANGE_FEATURE_HUMIDITY_NAMES = {"Indoor humidity", "Humidity"}
 RANGE_FEATURE_CO_NAMES = {"Carbon Monoxide", "CO"}
 RANGE_FEATURE_AIR_QUALITY_NAMES = {"Air Quality", "AQI"}
