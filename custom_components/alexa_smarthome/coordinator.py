@@ -159,10 +159,7 @@ class AlexaDataUpdateCoordinator(DataUpdateCoordinator[dict[str, list[Capability
                     device.display_name,
                     err,
                 )
-                # Return stale cache rather than fail the whole update
-                cached = self.device_store.get_states(device.endpoint_id)
-                if cached:
-                    results[device.endpoint_id] = cached
+                # Propagate auth errors immediately — caller needs to re-authenticate
                 raise UpdateFailed(f"Authentication error: {err}") from err
             except AlexaApiError as err:
                 _LOGGER.warning(
@@ -170,6 +167,8 @@ class AlexaDataUpdateCoordinator(DataUpdateCoordinator[dict[str, list[Capability
                     device.display_name,
                     err,
                 )
+                # Fall back to stale cache so the device doesn't go unavailable
+                # on a transient network error
                 cached = self.device_store.get_states(device.endpoint_id)
                 if cached:
                     results[device.endpoint_id] = cached

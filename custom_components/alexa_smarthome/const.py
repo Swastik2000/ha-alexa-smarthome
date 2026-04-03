@@ -5,18 +5,15 @@ DOMAIN = "alexa_smarthome"
 # Configuration keys
 CONF_AMAZON_DOMAIN = "amazon_domain"
 CONF_LANGUAGE = "language"
-CONF_PROXY_PORT = "proxy_port"
 CONF_CACHE_TTL = "cache_ttl"
 CONF_INCLUDE_DEVICES = "include_devices"
 CONF_EXCLUDE_DEVICES = "exclude_devices"
 CONF_DISABLED_OPERATIONS = "disabled_operations"
 CONF_COOKIE = "cookie"
-CONF_COOKIE_DATA = "cookie_data"
 
 # Defaults
 DEFAULT_AMAZON_DOMAIN = "amazon.com"
 DEFAULT_LANGUAGE = "en-US"
-DEFAULT_PROXY_PORT = 9000
 DEFAULT_CACHE_TTL = 60  # seconds
 DEFAULT_UPDATE_INTERVAL = 30  # seconds
 DEFAULT_REQUEST_TIMEOUT = 65  # seconds

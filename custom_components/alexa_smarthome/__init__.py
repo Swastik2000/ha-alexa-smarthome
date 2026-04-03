@@ -66,8 +66,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Forward setup to all platforms
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    # Register an unload hook to clean up the aiohttp session
-    entry.async_on_unload(session.close)
+    # Register an unload hook to clean up the aiohttp session.
+    # async_on_unload calls the callback with no arguments, so wrap in a lambda.
+    entry.async_on_unload(lambda: session.close())
 
     return True
 

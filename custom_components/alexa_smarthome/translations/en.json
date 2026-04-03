@@ -3,30 +3,33 @@
     "step": {
       "user": {
         "title": "Alexa Smart Home — Connection Settings",
-        "description": "Configure connection to the Amazon Alexa service.",
+        "description": "Configure your Amazon Alexa region and language.",
         "data": {
           "amazon_domain": "Amazon domain",
           "language": "Language (e.g. en-US)",
-          "proxy_port": "Proxy port",
           "cache_ttl": "State cache TTL (seconds)"
         },
         "data_description": {
-          "amazon_domain": "The Amazon domain where your devices are registered.",
-          "language": "The language/locale code for Alexa authentication.",
-          "proxy_port": "Local port for the authentication proxy server (1024–65535).",
+          "amazon_domain": "The Amazon domain where your devices are registered (e.g. amazon.com, amazon.co.uk).",
+          "language": "The language/locale code for your Alexa account.",
           "cache_ttl": "How long to cache device states before re-fetching (30–3600 seconds)."
         }
       },
-      "auth": {
-        "title": "Alexa Smart Home — Amazon Login",
-        "description": "Open **{proxy_url}** in your browser and log in to your Amazon account ({amazon_domain}) to complete authentication.\n\nOnce you have successfully logged in, return here and click **Submit** to finish setup.",
-        "data": {}
+      "cookie": {
+        "title": "Alexa Smart Home — Session Cookie",
+        "description": "To authenticate, you need to provide your Amazon session cookie.\n\n**How to get it:**\n1. Open **https://www.{amazon_domain}** in a browser and log in.\n2. Open Developer Tools (F12) → **Application** tab → **Cookies** → select `{amazon_domain}`.\n3. Click **Copy all as header value** (or manually copy all cookie key=value pairs separated by `;`).\n4. Paste the result below.\n\nThe cookie is stored locally and only sent to Amazon's Alexa API.",
+        "data": {
+          "cookie": "Amazon session cookie"
+        },
+        "data_description": {
+          "cookie": "The full Cookie header value from your browser (all key=value pairs separated by semicolons)."
+        }
       }
     },
     "error": {
-      "auth_not_complete": "Authentication is not complete yet. Please log in at the proxy URL first.",
-      "cannot_connect": "Cannot connect to the Alexa API. Check your network and cookie.",
-      "invalid_auth": "Invalid or expired Alexa session cookie. Please re-authenticate.",
+      "cookie_required": "Please paste your Amazon session cookie.",
+      "cannot_connect": "Cannot connect to the Alexa API. Check your network connection.",
+      "invalid_auth": "The cookie is invalid or expired. Please copy a fresh cookie from your browser.",
       "unknown": "Unexpected error. Check the Home Assistant logs for details."
     },
     "abort": {

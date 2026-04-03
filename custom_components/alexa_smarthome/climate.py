@@ -202,7 +202,8 @@ class AlexaClimateEntity(AlexaSmartHomeEntity, ClimateEntity):
         """
         if hvac_mode == HVACMode.OFF:
             if OPERATION_TURN_OFF in self._device.supported_operations:
-                await self._set_device_state(FEATURE_THERMOSTAT, OPERATION_TURN_OFF)
+                # Use the power feature to turn the thermostat off
+                await self._set_device_state(FEATURE_POWER, OPERATION_TURN_OFF)
             else:
                 await self._set_device_state(
                     FEATURE_THERMOSTAT,
@@ -260,7 +261,7 @@ class AlexaClimateEntity(AlexaSmartHomeEntity, ClimateEntity):
     async def async_turn_on(self) -> None:
         """Turn the thermostat on."""
         if OPERATION_TURN_ON in self._device.supported_operations:
-            await self._set_device_state(FEATURE_THERMOSTAT, OPERATION_TURN_ON)
+            await self._set_device_state(FEATURE_POWER, OPERATION_TURN_ON)
             await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self) -> None:
