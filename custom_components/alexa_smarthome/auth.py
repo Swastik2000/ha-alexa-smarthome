@@ -32,13 +32,8 @@ from .const import COOKIE_FILENAME
 
 _LOGGER = logging.getLogger(__name__)
 
-# Exact user-agent from alexa-cookie2 (Linux/Pi build)
-_USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/51.0.2704.103 Safari/537.36"
-    " PitanguiBridge/2.2.485407.0-[HARDWARE=linux_x86]"
-    "[SOFTWARE=51.0.2704.103][DEVICE=Linux]"
-)
+# Exact user-agent from alexa-cookie2 (iOS iPhone — required for amzn_dp_project_dee_ios auth flow)
+_USER_AGENT = "AppleWebKit PitanguiBridge/2.2.485407.0-[HARDWARE=iPhone10_4][SOFTWARE=15.5][DEVICE=iPhone]"
 
 # map-md cookie value — exact replica from alexa-cookie2
 _MAP_MD_PAYLOAD = {
@@ -409,6 +404,8 @@ class AlexaAuthManager:
             headers[name] = value
         headers["Host"] = upstream_base.replace("https://", "")
         headers["Cookie"] = self._cookie_header()
+        headers["Accept-Language"] = self._language
+        headers["authority"] = f"www.{d}"
 
         body = await request.read() if request.method in ("POST", "PUT", "PATCH") else None
 
