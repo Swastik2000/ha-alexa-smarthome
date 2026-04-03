@@ -73,6 +73,10 @@ class AlexaDataUpdateCoordinator(DataUpdateCoordinator[dict[str, list[Capability
         Should be called once during config entry setup before the first
         coordinator refresh.
         """
+        # Refresh CSRF token so mutations work (queries can work without it,
+        # but state-changing operations require a fresh token).
+        await self.api.refresh_csrf()
+
         _LOGGER.debug("Discovering Alexa smart home devices")
         try:
             all_devices = await self.api.get_devices()

@@ -563,6 +563,34 @@ class AlexaApiClient:
             headers["csrf"] = self._csrf
         return headers
 
+    async def refresh_csrf(self) -> None:
+        """Fetch a fresh CSRF token from the Alexa /api/language endpoint.
+
+        The CSRF token is required for state-mutating GraphQL operations.
+        alexa-remote2 refreshes this automatically; we replicate that here.
+        """
+        url = f"{self._base_url}/api/language"
+        headers = {
+            "User-Agent": _API_USER_AGENT,
+            "Accept": "application/json",
+        }
+        if self._local_cookie:
+            headers["Cookie"] = self._local_cookie
+        try:
+            async with self._session.get(
+                url, headers=headers, timeout=self._timeout
+            ) as resp:
+                csrf = resp.headers.get("csrf")
+                if csrf:
+                    self._csrf = csrf
+                    _LOGGER.debug("CSRF token refreshed (status %s)", resp.status)
+                else:
+                    _LOGGER.warning(
+                        "CSRF refresh: no csrf header in response (status %s)", resp.status
+                    )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Failed to refresh CSRF token: %s", err)
+
     async def _execute_graphql(
         self,
         query: str,
@@ -726,6 +754,11 @@ class AlexaApiClient:
 
         Mirrors setDeviceStateGraphQl() from AlexaApiWrapper.
         """
+        _LOGGER.debug(
+            "set_device_state: endpointId=%s featureName=%s operationName=%s payload=%s",
+            endpoint_id, feature_name, operation_name, payload,
+        )
+
         request: dict[str, Any] = {
             "endpointId": endpoint_id,
             "featureOperationName": operation_name,
@@ -734,10 +767,31 @@ class AlexaApiClient:
         if payload:
             request["payload"] = payload
 
-        await self._execute_graphql(
+        response = await self._execute_graphql(
             SET_ENDPOINT_FEATURES,
             variables={"featureControlRequests": [request]},
         )
+
+        result = (response.get("data") or {}).get("setEndpointFeatures") or {}
+        gql_errors = result.get("errors") or []
+        if gql_errors:
+            _LOGGER.error(
+                "setEndpointFeatures returned errors for %s: %s", endpoint_id, gql_errors
+            )
+            raise AlexaApiError(
+                f"setEndpointFeatures failed: {gql_errors}"
+            )
+
+        responses = result.get("featureControlResponses") or []
+        _LOGGER.debug("setEndpointFeatures success: %s", responses)
+
+        # Also surface top-level GraphQL errors (e.g. auth, schema errors)
+        top_errors = response.get("errors")
+        if top_errors:
+            _LOGGER.error(
+                "GraphQL top-level errors for %s: %s", endpoint_id, top_errors
+            )
+            raise AlexaApiError(f"GraphQL errors: {top_errors}")
 
 
 def _is_homebridge_skill_device(endpoint_reports: list[dict[str, Any]]) -> bool:
