@@ -19,14 +19,14 @@
       },
       "auth": {
         "title": "Alexa Smart Home — Amazon Login",
-        "description": "## Login in 3 steps\n\n1. Open **[{server_url}]({server_url})** in your browser\n2. Drag the **📦 Send to HA** button to your bookmarks bar\n3. Open [{amazon_domain}](https://www.{amazon_domain}), log in, then click the bookmarklet\n\nThe page will automatically detect when login is complete. Then click **Submit** below.",
+        "description": "## Login in 2 steps\n\n1. Open **[{server_url}]({server_url})** in your browser — you will see the Amazon login page\n2. Log in to your Amazon account — the session is captured automatically\n\nOnce logged in, return here and click **Submit** to finish setup.",
         "data": {}
       }
     },
     "error": {
-      "cookie_required": "Please paste your Amazon session cookie.",
+      "auth_not_complete": "Login not detected yet. Complete the steps in the browser first, then click Submit.",
       "cannot_connect": "Cannot connect to the Alexa API. Check your network connection.",
-      "invalid_auth": "The cookie is invalid or expired. Please copy a fresh cookie from your browser.",
+      "invalid_auth": "The session is invalid or expired. Please re-authenticate.",
       "unknown": "Unexpected error. Check the Home Assistant logs for details."
     },
     "abort": {
