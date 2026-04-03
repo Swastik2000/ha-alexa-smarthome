@@ -541,11 +541,15 @@ class AlexaApiClient:
         self._timeout = aiohttp.ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)
         self._local_cookie: str | None = None
         self._csrf: str | None = None
+        self._refresh_token: str | None = None
+        self._access_token: str | None = None
+        self._access_token_expiry: float = 0.0
 
     def set_registration_data(self, data: dict) -> None:
         """Update auth credentials from full registration data dict."""
         self._local_cookie = data.get("localCookie") or data.get("loginCookie")
         self._csrf = data.get("csrf")
+        self._refresh_token = data.get("refreshToken")
 
     @property
     def _headers(self) -> dict[str, str]:
@@ -562,6 +566,64 @@ class AlexaApiClient:
         if self._csrf:
             headers["csrf"] = self._csrf
         return headers
+
+    async def get_access_token(self) -> str | None:
+        """Obtain a Bearer access token from the stored refreshToken.
+
+        Mirrors alexa-remote2's getAuthApiBearerToken() and alexa-cookie2's
+        refreshAlexaCookie() — both POST to api.amazon.com/auth/token with
+        the refreshToken to get an access_token used for device control.
+
+        The token is cached until its expiry.
+        """
+        import time
+
+        if self._access_token and time.time() < self._access_token_expiry:
+            return self._access_token
+
+        if not self._refresh_token:
+            _LOGGER.debug("No refreshToken stored; cannot obtain Bearer access token")
+            return None
+
+        url = "https://api.amazon.com/auth/token"
+        data = (
+            "app_name=Homebridge"
+            "&app_version=2.2.595606.0"
+            "&di.sdk.version=6.12.4"
+            f"&source_token={self._refresh_token}"
+            "&package_name=com.amazon.echo"
+            "&di.hw.version=iPhone"
+            "&platform=iOS"
+            "&requested_token_type=access_token"
+            "&source_token_type=refresh_token"
+            "&di.os.name=iOS"
+            "&di.os.version=16.6"
+            "&current_version=6.12.4"
+        )
+        headers = {
+            "User-Agent": _API_USER_AGENT,
+            "Accept-Language": "en-US",
+            "Accept-Charset": "utf-8",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "x-amzn-identity-auth-domain": "api.amazon.com",
+        }
+        try:
+            async with self._session.post(
+                url, data=data, headers=headers, timeout=self._timeout
+            ) as resp:
+                body = await resp.json(content_type=None)
+                access_token = body.get("access_token")
+                expires_in = body.get("expires_in", 3600)
+                if access_token:
+                    self._access_token = access_token
+                    self._access_token_expiry = time.time() + expires_in - 60
+                    _LOGGER.debug("Bearer access token obtained (expires in %ss)", expires_in)
+                    return access_token
+                _LOGGER.warning("Failed to obtain Bearer access token: %s", body)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Error obtaining Bearer access token: %s", err)
+        return None
 
     async def refresh_csrf(self) -> None:
         """Fetch a fresh CSRF token from the Alexa /api/language endpoint.
@@ -774,12 +836,19 @@ class AlexaApiClient:
             ]
         }
 
+        # Build headers; include Bearer token if available — some third-party
+        # skill devices (e.g. Tuya) require device-level auth for control.
+        rest_headers = dict(self._headers)
+        access_token = await self.get_access_token()
+        if access_token:
+            rest_headers["Authorization"] = f"Bearer {access_token}"
+
         url = f"{self._base_url}/api/phoenix/state"
         try:
             async with self._session.put(
                 url,
                 json=body,
-                headers=self._headers,
+                headers=rest_headers,
                 timeout=self._timeout,
             ) as response:
                 if response.status == 401:
