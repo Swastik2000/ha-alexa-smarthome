@@ -1,0 +1,37 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Alexa Smart Home — Connection Settings",
+        "description": "Configure connection to the Amazon Alexa service.",
+        "data": {
+          "amazon_domain": "Amazon domain",
+          "language": "Language (e.g. en-US)",
+          "proxy_port": "Proxy port",
+          "cache_ttl": "State cache TTL (seconds)"
+        },
+        "data_description": {
+          "amazon_domain": "The Amazon domain where your devices are registered.",
+          "language": "The language/locale code for Alexa authentication.",
+          "proxy_port": "Local port for the authentication proxy server (1024–65535).",
+          "cache_ttl": "How long to cache device states before re-fetching (30–3600 seconds)."
+        }
+      },
+      "auth": {
+        "title": "Alexa Smart Home — Amazon Login",
+        "description": "Open **{proxy_url}** in your browser and log in to your Amazon account ({amazon_domain}) to complete authentication.\n\nOnce you have successfully logged in, return here and click **Submit** to finish setup.",
+        "data": {}
+      }
+    },
+    "error": {
+      "auth_not_complete": "Authentication is not complete yet. Please log in at the proxy URL first.",
+      "cannot_connect": "Cannot connect to the Alexa API. Check your network and cookie.",
+      "invalid_auth": "Invalid or expired Alexa session cookie. Please re-authenticate.",
+      "unknown": "Unexpected error. Check the Home Assistant logs for details."
+    },
+    "abort": {
+      "already_configured": "This Alexa account is already configured.",
+      "reauth_successful": "Re-authentication was successful."
+    }
+  }
+}

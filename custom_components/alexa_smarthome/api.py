@@ -1,0 +1,732 @@
+"""Alexa Smart Home API client using aiohttp for async GraphQL requests."""
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Any
+
+import aiohttp
+
+from .const import (
+    DEFAULT_MAX_CONCURRENT_REQUESTS,
+    DEFAULT_REQUEST_TIMEOUT,
+    EXCLUDED_SKILL_IDS_DEV,
+    EXCLUDED_SKILL_IDS_LIVE,
+    GRAPHQL_PATH,
+)
+from .models import CapabilityState, RangeFeatureCapability, SmartHomeDevice
+
+_LOGGER = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# GraphQL query strings — copied verbatim from the TypeScript source files
+# in src/wrapper/graphql/
+# ---------------------------------------------------------------------------
+
+ENDPOINTS_QUERY = """query Endpoints {
+  endpoints {
+    items {
+      id
+      friendlyName
+      displayCategories {
+        primary {
+          value
+        }
+      }
+      serialNumber {
+        value {
+          text
+        }
+      }
+      enablement
+      model {
+        value {
+          text
+        }
+      }
+      manufacturer {
+        value {
+          text
+        }
+      }
+      features {
+        name
+        instance
+        operations {
+          name
+        }
+        properties {
+          name
+          ... on RangeValue {
+            rangeValue {
+              value
+            }
+          }
+          ... on TemperatureSensor {
+            value {
+              value
+              scale
+            }
+          }
+          ... on ToggleState {
+            toggleStateValue
+          }
+          ... on Power {
+            powerStateValue
+          }
+          ... on Brightness {
+            brightnessStateValue
+          }
+          ... on Color {
+            colorStateValue {
+              hue
+              saturation
+              brightness
+            }
+          }
+          ... on ColorTemperature {
+            colorTemperatureInKelvinStateValue
+          }
+          ... on Lock {
+            lockState
+          }
+          ... on Setpoint {
+            value {
+              value
+              scale
+            }
+          }
+          ... on ThermostatMode {
+            thermostatModeValue
+          }
+        }
+        configuration {
+          ... on RangeConfiguration {
+            friendlyName {
+              value {
+                text
+              }
+            }
+          }
+        }
+      }
+      endpointReports {
+        reporter {
+          id
+          namespace
+          skillStage
+        }
+      }
+    }
+  }
+}"""
+
+LIGHT_QUERY = """query getPowerBrightnessColorColorTempStates(
+  $endpointId: String!
+) {
+  endpoint(id: $endpointId) {
+    features {
+      name
+      properties {
+        name
+        ... on Power {
+          powerStateValue
+        }
+        ... on Brightness {
+          brightnessStateValue
+        }
+        ... on Color {
+          colorStateValue {
+            hue
+            saturation
+            brightness
+          }
+        }
+        ... on ColorTemperature {
+          colorTemperatureInKelvinStateValue
+        }
+      }
+    }
+  }
+}
+"""
+
+POWER_QUERY = """query getPowerState(
+  $endpointId: String!
+) {
+  endpoint(id: $endpointId) {
+    features {
+      name
+      properties {
+        name
+        ... on Power {
+          powerStateValue
+        }
+      }
+    }
+  }
+}"""
+
+LOCK_QUERY = """query getLockState(
+  $endpointId: String!
+) {
+  endpoint(id: $endpointId) {
+    features {
+      name
+      __typename
+      properties {
+        name
+        ... on Lock {
+          lockState
+        }
+      }
+    }
+    __typename
+  }
+}"""
+
+THERMOSTAT_QUERY = """query getThermostatStates(
+  $endpointId: String!
+) {
+  endpoint(id: $endpointId) {
+    features {
+      name
+      properties {
+        name
+        ... on RangeValue {
+          rangeValue {
+            value
+          }
+        }
+        ... on Setpoint {
+          value {
+            value
+            scale
+          }
+        }
+        ... on TemperatureSensor {
+          value {
+            value
+            scale
+          }
+        }
+        ... on ThermostatMode {
+          thermostatModeValue
+        }
+      }
+      configuration {
+        ... on RangeConfiguration {
+          friendlyName {
+            value {
+              text
+            }
+          }
+        }
+      }
+    }
+  }
+}"""
+
+TEMP_SENSOR_QUERY = """query getTemperatureStates(
+  $endpointId: String!
+) {
+  endpoint(id: $endpointId) {
+    features {
+      name
+      properties {
+        name
+        ... on TemperatureSensor {
+          value {
+            value
+            scale
+          }
+        }
+      }
+    }
+  }
+}"""
+
+RANGE_QUERY = """query getRangeStates(
+  $endpointId: String!
+) {
+  endpoint(id: $endpointId) {
+    features {
+      name
+      instance
+      properties {
+        name
+        ... on RangeValue {
+          rangeValue {
+            value
+          }
+        }
+      }
+      configuration {
+        ... on RangeConfiguration {
+          friendlyName {
+            value {
+              text
+            }
+          }
+        }
+      }
+    }
+  }
+}"""
+
+AIR_QUALITY_QUERY = """query getAirQualityStates(
+  $endpointId: String!
+) {
+  endpoint(id: $endpointId) {
+    features {
+      name
+      properties {
+        name
+        ... on RangeValue {
+          rangeValue {
+            value
+          }
+        }
+        ... on TemperatureSensor {
+          value {
+            value
+            scale
+          }
+        }
+        ... on ToggleState {
+          toggleStateValue
+        }
+      }
+      configuration {
+        ... on RangeConfiguration {
+          friendlyName {
+            value {
+              text
+            }
+          }
+        }
+      }
+    }
+  }
+}"""
+
+SET_ENDPOINT_FEATURES = """mutation SetEndpointFeatures(
+  $featureControlRequests: [FeatureControlRequest!]!
+) {
+  setEndpointFeatures(featureControlRequests: $featureControlRequests) {
+    result
+  }
+}"""
+
+
+# ---------------------------------------------------------------------------
+# Custom exception types
+# ---------------------------------------------------------------------------
+
+
+class AlexaApiError(Exception):
+    """Base exception for all Alexa API errors."""
+
+
+class AlexaAuthError(AlexaApiError):
+    """Raised when authentication fails or the session cookie is invalid."""
+
+
+class AlexaDeviceOfflineError(AlexaApiError):
+    """Raised when a device is unreachable or offline."""
+
+
+# ---------------------------------------------------------------------------
+# State extraction helper — ported from src/domain/alexa/get-device-state.ts
+# ---------------------------------------------------------------------------
+
+
+def _extract_states(features: list[dict[str, Any]]) -> list[CapabilityState]:
+    """Parse GraphQL feature data into a flat list of CapabilityState objects.
+
+    Mirrors the extractStates() function from get-device-state.ts.
+    """
+    states: list[CapabilityState] = []
+
+    # Flatten features that have multiple properties into individual entries,
+    # matching the TypeScript implementation.
+    flat: list[dict[str, Any]] = []
+    for feature in features:
+        props = feature.get("properties") or []
+        if len(props) <= 1:
+            flat.append(feature)
+        else:
+            for prop in props:
+                flat.append({**feature, "properties": [prop]})
+
+    for f in flat:
+        name = f.get("name", "")
+        props = f.get("properties") or []
+        prop = props[0] if props else {}
+        prop_name = prop.get("name")
+
+        if name == "brightness":
+            brightness = prop.get("brightnessStateValue")
+            if isinstance(brightness, (int, float)):
+                states.append(CapabilityState(
+                    feature_name=name,
+                    value=brightness,
+                    name=prop_name,
+                ))
+
+        elif name == "color":
+            color_val = prop.get("colorStateValue")
+            if isinstance(color_val, dict):
+                states.append(CapabilityState(
+                    feature_name=name,
+                    value=color_val,
+                    name=prop_name,
+                ))
+
+        elif name == "colorTemperature":
+            ct_val = prop.get("colorTemperatureInKelvinStateValue")
+            if isinstance(ct_val, (int, float)):
+                states.append(CapabilityState(
+                    feature_name=name,
+                    value=ct_val,
+                    name=prop_name,
+                ))
+
+        elif name == "lock":
+            lock_state = prop.get("lockState")
+            if isinstance(lock_state, str):
+                states.append(CapabilityState(
+                    feature_name=name,
+                    value=lock_state,
+                    name=prop_name,
+                ))
+
+        elif name == "power":
+            power_val = prop.get("powerStateValue")
+            if isinstance(power_val, str):
+                states.append(CapabilityState(
+                    feature_name=name,
+                    value=power_val,
+                    name=prop_name,
+                ))
+
+        elif name == "toggle":
+            toggle_val = prop.get("toggleStateValue")
+            if isinstance(toggle_val, str):
+                states.append(CapabilityState(
+                    feature_name=name,
+                    value=toggle_val,
+                    name=prop_name,
+                ))
+
+        elif name == "temperatureSensor":
+            temp_obj = prop.get("value")
+            if isinstance(temp_obj, dict) and isinstance(temp_obj.get("value"), (int, float)):
+                states.append(CapabilityState(
+                    feature_name=name,
+                    value=temp_obj,
+                    name=prop_name,
+                ))
+
+        elif name == "range":
+            instance = f.get("instance")
+            range_val_obj = prop.get("rangeValue")
+            config = f.get("configuration") or {}
+            friendly_name_obj = config.get("friendlyName", {})
+            friendly_name = (
+                friendly_name_obj.get("value", {}).get("text")
+                if isinstance(friendly_name_obj, dict)
+                else None
+            )
+            if (
+                isinstance(instance, str)
+                and isinstance(range_val_obj, dict)
+                and isinstance(range_val_obj.get("value"), (int, float))
+            ):
+                states.append(CapabilityState(
+                    feature_name=name,
+                    value=range_val_obj["value"],
+                    instance=instance,
+                    name=prop_name,
+                    range_name=friendly_name,
+                ))
+
+        elif name == "thermostat":
+            if prop_name == "thermostatMode":
+                mode_val = prop.get("thermostatModeValue")
+                if isinstance(mode_val, str):
+                    states.append(CapabilityState(
+                        feature_name=name,
+                        value=mode_val,
+                        name=prop_name,
+                    ))
+            elif prop_name in ("targetSetpoint", "upperSetpoint", "lowerSetpoint"):
+                setpoint_obj = prop.get("value")
+                if isinstance(setpoint_obj, dict) and isinstance(setpoint_obj.get("value"), (int, float)):
+                    states.append(CapabilityState(
+                        feature_name=name,
+                        value=setpoint_obj,
+                        name=prop_name,
+                    ))
+
+    return states
+
+
+def _extract_range_features(
+    features: list[dict[str, Any]],
+) -> list[RangeFeatureCapability]:
+    """Extract range feature capability metadata from endpoint features."""
+    result: list[RangeFeatureCapability] = []
+    for f in features:
+        if f.get("name") != "range":
+            continue
+        instance = f.get("instance")
+        config = f.get("configuration") or {}
+        friendly_name_obj = config.get("friendlyName", {})
+        friendly_name = (
+            friendly_name_obj.get("value", {}).get("text")
+            if isinstance(friendly_name_obj, dict)
+            else None
+        )
+        if isinstance(instance, str) and isinstance(friendly_name, str):
+            result.append(RangeFeatureCapability(
+                instance=instance,
+                friendly_name=friendly_name,
+            ))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# API client
+# ---------------------------------------------------------------------------
+
+
+class AlexaApiClient:
+    """Async client for Alexa Smart Home GraphQL API.
+
+    Uses aiohttp with a semaphore limiting max 2 concurrent requests and a
+    65-second request timeout, mirroring the TypeScript implementation in
+    src/wrapper/alexa-api-wrapper.ts.
+    """
+
+    def __init__(
+        self,
+        amazon_domain: str,
+        session: aiohttp.ClientSession,
+    ) -> None:
+        self._base_url = f"https://alexa.{amazon_domain}"
+        self._session = session
+        self._semaphore = asyncio.Semaphore(DEFAULT_MAX_CONCURRENT_REQUESTS)
+        self._timeout = aiohttp.ClientTimeout(total=DEFAULT_REQUEST_TIMEOUT)
+        self._cookie: str | None = None
+
+    def set_cookie(self, cookie: str) -> None:
+        """Update the session cookie used for authentication."""
+        self._cookie = cookie
+
+    @property
+    def _headers(self) -> dict[str, str]:
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        if self._cookie:
+            headers["Cookie"] = self._cookie
+        return headers
+
+    async def _execute_graphql(
+        self,
+        query: str,
+        variables: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Execute a GraphQL query/mutation and return the parsed response."""
+        async with self._semaphore:
+            payload: dict[str, Any] = {"query": query}
+            if variables:
+                payload["variables"] = variables
+
+            url = f"{self._base_url}{GRAPHQL_PATH}"
+            try:
+                async with self._session.post(
+                    url,
+                    json=payload,
+                    headers=self._headers,
+                    timeout=self._timeout,
+                ) as response:
+                    if response.status == 401:
+                        raise AlexaAuthError(
+                            "Authentication failed (401). Re-authentication required."
+                        )
+                    if response.status == 403:
+                        raise AlexaAuthError(
+                            "Access denied (403). Check your session cookie."
+                        )
+                    response.raise_for_status()
+                    data: dict[str, Any] = await response.json(content_type=None)
+                    return data
+            except aiohttp.ClientResponseError as err:
+                raise AlexaApiError(
+                    f"HTTP error {err.status} calling Alexa API: {err.message}"
+                ) from err
+            except asyncio.TimeoutError as err:
+                raise AlexaApiError(
+                    "Timeout waiting for Alexa API response (>65s)"
+                ) from err
+            except aiohttp.ClientError as err:
+                raise AlexaApiError(
+                    f"Network error calling Alexa API: {err}"
+                ) from err
+
+    async def get_devices(self) -> list[SmartHomeDevice]:
+        """Fetch all smart home devices via EndpointsQuery.
+
+        Filters out Homebridge-related skill devices, matching the
+        excludeHomebridgeAlexaPluginDevices logic in AlexaApiWrapper.getDevices().
+        """
+        response = await self._execute_graphql(ENDPOINTS_QUERY)
+
+        items = (
+            (response.get("data") or {})
+            .get("endpoints", {})
+            or {}
+        ).get("items") or []
+
+        if not isinstance(items, list):
+            raise AlexaApiError(
+                "Unexpected response from Alexa API: endpoints.items is not a list"
+            )
+
+        devices: list[SmartHomeDevice] = []
+        for endpoint in items:
+            # Must have a primary display category
+            display_categories = endpoint.get("displayCategories") or {}
+            primary = (display_categories.get("primary") or {})
+            device_type = primary.get("value")
+            if not device_type:
+                continue
+
+            # Filter out Homebridge Alexa skill devices
+            endpoint_reports = endpoint.get("endpointReports") or []
+            if _is_homebridge_skill_device(endpoint_reports):
+                _LOGGER.debug(
+                    "Skipping Homebridge skill device: %s",
+                    endpoint.get("friendlyName"),
+                )
+                continue
+
+            endpoint_id = endpoint.get("id", "")
+            device_id = endpoint_id.replace("amzn1.alexa.endpoint.", "")
+            features = endpoint.get("features") or []
+
+            supported_operations: list[str] = []
+            for feature in features:
+                for op in (feature.get("operations") or []):
+                    op_name = op.get("name")
+                    if op_name:
+                        supported_operations.append(op_name)
+
+            range_features = _extract_range_features(features)
+
+            serial_obj = endpoint.get("serialNumber") or {}
+            serial = (serial_obj.get("value") or {}).get("text") or "Unknown"
+
+            model_obj = endpoint.get("model") or {}
+            model = (model_obj.get("value") or {}).get("text") or "Unknown"
+
+            mfr_obj = endpoint.get("manufacturer") or {}
+            manufacturer = (mfr_obj.get("value") or {}).get("text") or "Amazon"
+
+            devices.append(SmartHomeDevice(
+                endpoint_id=endpoint_id,
+                id=device_id,
+                display_name=endpoint.get("friendlyName", "Unknown Device"),
+                supported_operations=supported_operations,
+                enabled=endpoint.get("enablement") == "ENABLED",
+                device_type=device_type,
+                serial_number=serial,
+                model=model,
+                manufacturer=manufacturer,
+                range_features=range_features,
+            ))
+
+        return devices
+
+    async def get_device_states(
+        self,
+        device: SmartHomeDevice,
+        query_type: str = "power",
+    ) -> list[CapabilityState]:
+        """Fetch current states for a device using the appropriate query.
+
+        Args:
+            device: The device to query.
+            query_type: One of 'light', 'lock', 'thermostat', 'temp_sensor',
+                        'range', 'air_quality', or 'power' (default).
+        """
+        query_map = {
+            "light": LIGHT_QUERY,
+            "lock": LOCK_QUERY,
+            "thermostat": THERMOSTAT_QUERY,
+            "temp_sensor": TEMP_SENSOR_QUERY,
+            "range": RANGE_QUERY,
+            "air_quality": AIR_QUALITY_QUERY,
+            "power": POWER_QUERY,
+        }
+        query = query_map.get(query_type, POWER_QUERY)
+
+        response = await self._execute_graphql(
+            query,
+            variables={"endpointId": device.endpoint_id},
+        )
+        features = (
+            (response.get("data") or {})
+            .get("endpoint", {})
+            or {}
+        ).get("features") or []
+
+        return _extract_states(features)
+
+    async def set_device_state(
+        self,
+        endpoint_id: str,
+        feature_name: str,
+        operation_name: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Execute a SetEndpointFeatures GraphQL mutation.
+
+        Mirrors setDeviceStateGraphQl() from AlexaApiWrapper.
+        """
+        request: dict[str, Any] = {
+            "endpointId": endpoint_id,
+            "featureOperationName": operation_name,
+            "featureName": feature_name,
+        }
+        if payload:
+            request["payload"] = payload
+
+        await self._execute_graphql(
+            SET_ENDPOINT_FEATURES,
+            variables={"featureControlRequests": [request]},
+        )
+
+
+def _is_homebridge_skill_device(endpoint_reports: list[dict[str, Any]]) -> bool:
+    """Return True if the device was added by the Homebridge Alexa skill.
+
+    Mirrors the excludeHomebridgeAlexaPluginDevices filter in
+    AlexaApiWrapper.getDevices().
+    """
+    for report in endpoint_reports:
+        reporter = report.get("reporter") or {}
+        skill_stage = (reporter.get("skillStage") or "").lower()
+        skill_id = reporter.get("id", "")
+        if (
+            skill_stage == "development"
+            and skill_id == EXCLUDED_SKILL_IDS_DEV
+        ) or (
+            skill_stage == "live"
+            and skill_id == EXCLUDED_SKILL_IDS_LIVE
+        ):
+            return True
+    return False

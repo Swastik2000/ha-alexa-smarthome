@@ -1,0 +1,11 @@
+{
+  "domain": "alexa_smarthome",
+  "name": "Alexa Smart Home",
+  "version": "1.0.0",
+  "documentation": "https://github.com/swastikmishra-atlan/ha-alexa-smarthome",
+  "requirements": ["aiohttp>=3.8.0"],
+  "dependencies": [],
+  "codeowners": ["@swastikmishra-atlan"],
+  "iot_class": "cloud_polling",
+  "config_flow": true
+}
