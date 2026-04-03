@@ -7,29 +7,26 @@
         "data": {
           "amazon_domain": "Amazon domain",
           "language": "Language (e.g. en-US)",
+          "proxy_port": "Auth server port",
           "cache_ttl": "State cache TTL (seconds)"
         },
         "data_description": {
-          "amazon_domain": "The Amazon domain where your devices are registered (e.g. amazon.com, amazon.co.uk).",
+          "amazon_domain": "The Amazon domain where your devices are registered.",
           "language": "The language/locale code for your Alexa account.",
+          "proxy_port": "Port for the local login helper server (default: 9000).",
           "cache_ttl": "How long to cache device states before re-fetching (30–3600 seconds)."
         }
       },
-      "cookie": {
-        "title": "Alexa Smart Home — Session Cookie",
-        "description": "To authenticate, you need to provide your Amazon session cookie.\n\n**How to get it:**\n1. Open **https://www.{amazon_domain}** in a browser and log in.\n2. Open Developer Tools (F12) → **Application** tab → **Cookies** → select `{amazon_domain}`.\n3. Click **Copy all as header value** (or manually copy all cookie key=value pairs separated by `;`).\n4. Paste the result below.\n\nThe cookie is stored locally and only sent to Amazon's Alexa API.",
-        "data": {
-          "cookie": "Amazon session cookie"
-        },
-        "data_description": {
-          "cookie": "The full Cookie header value from your browser (all key=value pairs separated by semicolons)."
-        }
+      "auth": {
+        "title": "Alexa Smart Home — Amazon Login",
+        "description": "## Login in 3 steps\n\n1. Open **[{server_url}]({server_url})** in your browser\n2. Drag the **📦 Send to HA** button to your bookmarks bar\n3. Open [{amazon_domain}](https://www.{amazon_domain}), log in, then click the bookmarklet\n\nThe page will automatically detect when login is complete. Then click **Submit** below.",
+        "data": {}
       }
     },
     "error": {
-      "cookie_required": "Please paste your Amazon session cookie.",
+      "auth_not_complete": "Login not detected yet. Complete the steps in the browser first, then click Submit.",
       "cannot_connect": "Cannot connect to the Alexa API. Check your network connection.",
-      "invalid_auth": "The cookie is invalid or expired. Please copy a fresh cookie from your browser.",
+      "invalid_auth": "The session is invalid or expired. Please re-authenticate.",
       "unknown": "Unexpected error. Check the Home Assistant logs for details."
     },
     "abort": {
