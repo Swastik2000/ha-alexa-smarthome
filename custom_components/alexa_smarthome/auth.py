@@ -1,13 +1,17 @@
-"""Authentication manager for the Alexa Smart Home integration.
+"""Authentication proxy for the Alexa Smart Home integration.
 
-Provides a local HTTP server that:
-1. Serves a setup page with a drag-and-drop bookmarklet
-2. User logs in to Amazon normally in their browser
-3. User clicks the bookmarklet once — it extracts document.cookie and POSTs
-   it back to the local server automatically
-4. Server signals the config flow; setup completes without any manual copying
+Replicates the alexa-cookie2 approach used by the Homebridge plugin:
 
-The cookie is persisted to disk and reused until a 401/403 triggers re-auth.
+1. Starts a local HTTP server on a configurable port (default 9000)
+2. The server acts as a transparent proxy — it fetches Amazon pages
+   server-side over HTTPS, rewrites URLs to go through the proxy,
+   and serves the content to the browser over plain HTTP
+3. All Set-Cookie headers from Amazon responses are captured
+4. When a successful login is detected the cookie is persisted and
+   the config flow is signalled to complete
+
+The user never interacts with Amazon directly — they open
+http://<ha-host>:9000 and see a real Amazon login page.
 """
 from __future__ import annotations
 
@@ -15,13 +19,25 @@ import asyncio
 import json
 import logging
 import os
+import re
 from typing import Any
 
+import aiohttp
 from aiohttp import web
 
 from .const import COOKIE_FILENAME
 
 _LOGGER = logging.getLogger(__name__)
+
+# Cookies that indicate a completed Amazon login
+_AUTH_COOKIES = {"at-main", "sess-at-main", "x-main", "ubid-main"}
+
+# Headers we must NOT forward from the proxied response to the browser
+_HOP_BY_HOP = {
+    "connection", "keep-alive", "transfer-encoding", "te",
+    "trailer", "upgrade", "proxy-authorization", "proxy-authenticate",
+    "content-encoding",  # we decode on the server side
+}
 
 
 class AlexaAuthError(Exception):
@@ -29,7 +45,7 @@ class AlexaAuthError(Exception):
 
 
 class AlexaAuthManager:
-    """Manages Amazon session cookie acquisition via a bookmarklet proxy server."""
+    """Transparent HTTP proxy that captures the Amazon session cookie."""
 
     def __init__(
         self,
@@ -45,13 +61,12 @@ class AlexaAuthManager:
         self._proxy_port = proxy_port
         self._ha_host = ha_host
         self._cookie_path = os.path.join(config_dir, COOKIE_FILENAME)
-        self._cookie: str | None = None
-        self._runner: web.AppRunner | None = None
-        self._auth_event: asyncio.Event = asyncio.Event()
 
-    @property
-    def cookie_path(self) -> str:
-        return self._cookie_path
+        self._captured_cookies: dict[str, str] = {}
+        self._cookie: str | None = None
+        self._auth_event: asyncio.Event = asyncio.Event()
+        self._runner: web.AppRunner | None = None
+        self._upstream_session: aiohttp.ClientSession | None = None
 
     @property
     def server_url(self) -> str:
@@ -76,7 +91,10 @@ class AlexaAuthManager:
         return None
 
     def save_cookie(self, cookie: str) -> None:
-        data: dict[str, Any] = {"cookie": cookie, "amazon_domain": self._amazon_domain}
+        data: dict[str, Any] = {
+            "cookie": cookie,
+            "amazon_domain": self._amazon_domain,
+        }
         try:
             with open(self._cookie_path, "w") as fp:
                 json.dump(data, fp)
@@ -97,208 +115,180 @@ class AlexaAuthManager:
         return await self.load_cookie()
 
     # ------------------------------------------------------------------
-    # Local HTTP server
+    # Proxy server
     # ------------------------------------------------------------------
 
     async def start_server(self) -> str:
-        """Start the local auth server. Returns the URL to open."""
+        """Start the proxy server. Returns the URL for the user to open."""
         if self._runner is not None:
             return self.server_url
 
+        # Upstream session used by the proxy to talk to Amazon
+        self._upstream_session = aiohttp.ClientSession(
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                )
+            }
+        )
+
         app = web.Application()
-        app.router.add_get("/", self._handle_index)
-        app.router.add_post("/cookie", self._handle_cookie)
-        app.router.add_get("/status", self._handle_status)
-        app.router.add_get("/success", self._handle_success)
+        app.router.add_route("*", "/{path_info:.*}", self._handle_proxy)
 
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, "0.0.0.0", self._proxy_port)
         await site.start()
-        _LOGGER.info("Alexa auth server started at %s", self.server_url)
+        _LOGGER.info("Alexa auth proxy started at %s", self.server_url)
         return self.server_url
 
     async def stop_server(self) -> None:
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
+        if self._upstream_session:
+            await self._upstream_session.close()
+            self._upstream_session = None
 
     async def wait_for_cookie(self, timeout: float = 600.0) -> str:
-        """Block until the bookmarklet submits the cookie."""
+        """Wait until the user completes login."""
         try:
             await asyncio.wait_for(self._auth_event.wait(), timeout=timeout)
         except asyncio.TimeoutError as err:
             raise AlexaAuthError("Authentication timed out") from err
         if not self._cookie:
-            raise AlexaAuthError("No cookie received")
+            raise AlexaAuthError("No cookie captured")
         return self._cookie
 
     # ------------------------------------------------------------------
-    # Request handlers
+    # Proxy request handler
     # ------------------------------------------------------------------
 
-    async def _handle_index(self, request: web.Request) -> web.Response:
-        """Serve the setup page with the bookmarklet."""
-        server_url = self.server_url
-        amazon_url = f"https://www.{self._amazon_domain}"
+    async def _handle_proxy(self, request: web.Request) -> web.StreamResponse:
+        """Forward the request to Amazon, rewrite response, capture cookies."""
+        amazon_base = f"https://www.{self._amazon_domain}"
+        path = request.path or "/"
+        if not path.startswith("/"):
+            path = "/" + path
+        query = request.query_string
+        upstream_url = f"{amazon_base}{path}"
+        if query:
+            upstream_url = f"{upstream_url}?{query}"
 
-        # The bookmarklet JS — runs on amazon.com, POSTs document.cookie back
-        bookmarklet_js = (
-            "javascript:(function(){"
-            f"fetch('http://{self._ha_host}:{self._proxy_port}/cookie',{{"
-            "method:'POST',"
-            "headers:{'Content-Type':'application/json'},"
-            f"body:JSON.stringify({{cookie:document.cookie,domain:'{self._amazon_domain}'}})"
-            "}}).then(r=>r.json()).then(d=>{"
-            "if(d.status==='ok'){alert('✅ Alexa Smart Home: Login captured! Return to Home Assistant to finish setup.');}"
-            "else{alert('❌ Error: '+JSON.stringify(d));}"
-            "}).catch(e=>alert('❌ Failed to send cookie: '+e));"
-            "})()"
+        # Forward cookies we've already captured back to Amazon
+        upstream_cookie = "; ".join(
+            f"{k}={v}" for k, v in self._captured_cookies.items()
         )
 
-        html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Alexa Smart Home — Login</title>
-  <style>
-    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-           background: #1a1a2e; color: #eee; min-height: 100vh;
-           display: flex; align-items: center; justify-content: center; padding: 20px; }}
-    .card {{ background: #16213e; border-radius: 16px; padding: 40px;
-             max-width: 560px; width: 100%; box-shadow: 0 20px 60px rgba(0,0,0,0.5); }}
-    h1 {{ font-size: 1.6rem; margin-bottom: 8px; color: #4fc3f7; }}
-    .subtitle {{ color: #aaa; margin-bottom: 32px; font-size: 0.95rem; }}
-    .step {{ display: flex; gap: 16px; margin-bottom: 28px; align-items: flex-start; }}
-    .step-num {{ background: #4fc3f7; color: #000; width: 32px; height: 32px;
-                 border-radius: 50%; display: flex; align-items: center;
-                 justify-content: center; font-weight: bold; flex-shrink: 0; }}
-    .step-body h3 {{ font-size: 1rem; margin-bottom: 6px; }}
-    .step-body p {{ color: #bbb; font-size: 0.9rem; line-height: 1.5; }}
-    .bookmarklet {{
-      display: inline-block; margin-top: 10px;
-      padding: 10px 20px; background: #ff9900; color: #000;
-      border-radius: 8px; font-weight: bold; text-decoration: none;
-      font-size: 0.95rem; cursor: grab; border: 3px dashed #ffcc44;
-    }}
-    .bookmarklet:active {{ cursor: grabbing; }}
-    .hint {{ font-size: 0.8rem; color: #888; margin-top: 6px; }}
-    .amazon-btn {{
-      display: inline-block; margin-top: 10px;
-      padding: 12px 24px; background: #ff9900; color: #000;
-      border-radius: 8px; font-weight: bold; text-decoration: none;
-      font-size: 1rem;
-    }}
-    .status-box {{ background: #0d1b2a; border-radius: 8px; padding: 16px;
-                   margin-top: 24px; text-align: center; }}
-    #status {{ color: #aaa; font-size: 0.9rem; }}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>Alexa Smart Home</h1>
-    <p class="subtitle">Connect your Amazon account to Home Assistant</p>
+        # Build upstream headers
+        headers: dict[str, str] = {}
+        for name, value in request.headers.items():
+            if name.lower() in ("host", "cookie", "content-length"):
+                continue
+            headers[name] = value
+        headers["Host"] = f"www.{self._amazon_domain}"
+        if upstream_cookie:
+            headers["Cookie"] = upstream_cookie
 
-    <div class="step">
-      <div class="step-num">1</div>
-      <div class="step-body">
-        <h3>Add the bookmarklet to your browser</h3>
-        <p>Drag the button below to your browser's bookmarks bar.</p>
-        <a class="bookmarklet" href="{bookmarklet_js}">📦 Send to HA</a>
-        <p class="hint">Drag this to your bookmarks bar — you'll click it after logging in.</p>
-      </div>
-    </div>
-
-    <div class="step">
-      <div class="step-num">2</div>
-      <div class="step-body">
-        <h3>Log in to Amazon</h3>
-        <p>Open Amazon and sign in to the account linked to your Alexa devices.</p>
-        <a class="amazon-btn" href="{amazon_url}" target="_blank">Open {self._amazon_domain} →</a>
-      </div>
-    </div>
-
-    <div class="step">
-      <div class="step-num">3</div>
-      <div class="step-body">
-        <h3>Click the bookmarklet</h3>
-        <p>Once logged in on Amazon, click the <strong>📦 Send to HA</strong> bookmarklet you just added.
-        A popup will confirm success, then return to Home Assistant — setup completes automatically.</p>
-      </div>
-    </div>
-
-    <div class="status-box">
-      <div id="status">⏳ Waiting for login…</div>
-    </div>
-  </div>
-
-  <script>
-    // Poll for completion every 3 seconds
-    setInterval(async () => {{
-      try {{
-        const r = await fetch('/status');
-        const d = await r.json();
-        if (d.authenticated) {{
-          document.getElementById('status').innerHTML =
-            '✅ <strong>Login captured!</strong> Return to Home Assistant to finish setup.';
-          document.getElementById('status').style.color = '#66bb6a';
-        }}
-      }} catch(e) {{}}
-    }}, 3000);
-  </script>
-</body>
-</html>"""
-        return web.Response(text=html, content_type="text/html")
-
-    async def _handle_cookie(self, request: web.Request) -> web.Response:
-        """Receive the cookie POSTed by the bookmarklet."""
-        # Allow cross-origin requests from Amazon
-        headers = {
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type",
-        }
-        if request.method == "OPTIONS":
-            return web.Response(headers=headers)
+        # Read request body for POST
+        body = await request.read() if request.method == "POST" else None
 
         try:
-            body = await request.json()
-            cookie = (body.get("cookie") or "").strip()
-            if not cookie:
-                return web.Response(
-                    status=400,
-                    text=json.dumps({"status": "error", "message": "No cookie received"}),
-                    content_type="application/json",
-                    headers=headers,
+            assert self._upstream_session is not None
+            async with self._upstream_session.request(
+                method=request.method,
+                url=upstream_url,
+                headers=headers,
+                data=body,
+                allow_redirects=False,
+                ssl=True,
+            ) as upstream:
+                # Capture cookies from this response
+                self._capture_cookies(upstream)
+
+                # Build response headers, rewriting Location if needed
+                resp_headers: dict[str, str] = {}
+                for name, value in upstream.headers.items():
+                    if name.lower() in _HOP_BY_HOP:
+                        continue
+                    if name.lower() == "location":
+                        value = self._rewrite_url(value)
+                    if name.lower() == "set-cookie":
+                        continue  # We handle cookies ourselves
+                    resp_headers[name] = value
+
+                status = upstream.status
+
+                # Read and rewrite body for HTML responses
+                content_type = upstream.headers.get("Content-Type", "")
+                raw_body = await upstream.read()
+
+                if "text/html" in content_type:
+                    try:
+                        text = raw_body.decode("utf-8", errors="replace")
+                        text = self._rewrite_html(text)
+                        raw_body = text.encode("utf-8")
+                        resp_headers["Content-Type"] = "text/html; charset=utf-8"
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                resp_headers["Content-Length"] = str(len(raw_body))
+
+                response = web.Response(
+                    status=status,
+                    headers=resp_headers,
+                    body=raw_body,
                 )
-            self._cookie = cookie
-            self.save_cookie(cookie)
-            self._auth_event.set()
-            _LOGGER.info("Alexa session cookie received via bookmarklet")
-            return web.Response(
-                text=json.dumps({"status": "ok"}),
-                content_type="application/json",
-                headers=headers,
-            )
-        except Exception as err:  # noqa: BLE001
-            return web.Response(
-                status=400,
-                text=json.dumps({"status": "error", "message": str(err)}),
-                content_type="application/json",
-                headers=headers,
-            )
+                return response
 
-    async def _handle_status(self, request: web.Request) -> web.Response:
-        return web.Response(
-            text=json.dumps({"authenticated": bool(self._cookie)}),
-            content_type="application/json",
-            headers={"Access-Control-Allow-Origin": "*"},
-        )
+        except aiohttp.ClientError as err:
+            _LOGGER.error("Proxy upstream error: %s", err)
+            return web.Response(status=502, text=f"Proxy error: {err}")
 
-    async def _handle_success(self, request: web.Request) -> web.Response:
-        return web.Response(
-            text="<h1>✅ Done! Return to Home Assistant.</h1>",
-            content_type="text/html",
+    def _capture_cookies(self, response: aiohttp.ClientResponse) -> None:
+        """Extract Set-Cookie headers and accumulate into our cookie jar."""
+        for cookie_header in response.headers.getall("Set-Cookie", []):
+            # Parse name=value; attrs...
+            parts = cookie_header.split(";")
+            name_value = parts[0].strip()
+            if "=" in name_value:
+                name, _, value = name_value.partition("=")
+                self._captured_cookies[name.strip()] = value.strip()
+
+        # Check if we now have enough cookies to authenticate
+        if _AUTH_COOKIES.issubset(set(self._captured_cookies.keys())):
+            cookie_str = "; ".join(
+                f"{k}={v}" for k, v in self._captured_cookies.items()
+            )
+            self._cookie = cookie_str
+            self.save_cookie(cookie_str)
+            if not self._auth_event.is_set():
+                _LOGGER.info("Alexa: login cookie captured successfully")
+                self._auth_event.set()
+
+    def _rewrite_url(self, url: str) -> str:
+        """Rewrite an Amazon URL to go through our proxy."""
+        amazon_base = f"https://www.{self._amazon_domain}"
+        proxy_base = self.server_url
+        if url.startswith(amazon_base):
+            return url.replace(amazon_base, proxy_base, 1)
+        if url.startswith(f"https://www.{self._amazon_domain}"):
+            return url.replace(
+                f"https://www.{self._amazon_domain}", proxy_base, 1
+            )
+        return url
+
+    def _rewrite_html(self, html: str) -> str:
+        """Rewrite Amazon URLs in HTML to point to our proxy."""
+        amazon_https = f"https://www.{self._amazon_domain}"
+        amazon_http = f"http://www.{self._amazon_domain}"
+        proxy = self.server_url
+        html = html.replace(amazon_https, proxy)
+        html = html.replace(amazon_http, proxy)
+        # Also rewrite protocol-relative URLs
+        html = html.replace(
+            f"//www.{self._amazon_domain}", proxy.replace("http://", "//")
         )
+        return html
