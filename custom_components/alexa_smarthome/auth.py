@@ -48,6 +48,10 @@ _API_USER_AGENT = "AmazonWebView/Amazon Alexa/2.2.651540.0/iOS/18.3.1/iPhone"
 # API version used in registration calls
 _API_CALL_VERSION = "2.2.651540.0"
 
+# Base Amazon domain for registration API calls — always amazon.com regardless of
+# user's country domain (mirrors baseAmazonPage defaulting to 'amazon.com' in alexa-cookie2)
+_BASE_AMAZON_PAGE = "amazon.com"
+
 # map-md cookie value — exact replica from alexa-cookie2
 _MAP_MD_PAYLOAD = {
     "device_user_dictionary": [],
@@ -396,7 +400,8 @@ class AlexaAuthManager:
                 "website_cookies": [
                     {"Name": k, "Value": v} for k, v in cookies.items()
                 ],
-                "domain": f".{self._amazon_domain}",
+                # Registration domain is always .amazon.com (baseAmazonPage in alexa-cookie2)
+                "domain": f".{_BASE_AMAZON_PAGE}",
             },
             "registration_data": {
                 "domain": "Device",
@@ -424,6 +429,7 @@ class AlexaAuthManager:
             "requested_token_type": ["bearer", "mac_dms", "website_cookies"],
         }
 
+        # Registration always goes to api.amazon.com (baseAmazonPage in alexa-cookie2)
         api_headers = {
             "User-Agent": _API_USER_AGENT,
             "Accept-Language": self._language,
@@ -432,7 +438,7 @@ class AlexaAuthManager:
             "Content-Type": "application/json",
             "Cookie": login_cookie,
             "Accept": "application/json",
-            "x-amzn-identity-auth-domain": f"api.{self._amazon_domain}",
+            "x-amzn-identity-auth-domain": f"api.{_BASE_AMAZON_PAGE}",
         }
 
         timeout = aiohttp.ClientTimeout(total=30)
@@ -440,7 +446,7 @@ class AlexaAuthManager:
             # ---- Step 1: Register App ----
             _LOGGER.debug("Alexa: registering app with Amazon")
             async with session.post(
-                f"https://api.{self._amazon_domain}/auth/register",
+                f"https://api.{_BASE_AMAZON_PAGE}/auth/register",
                 json=register_data,
                 headers=api_headers,
                 timeout=timeout,
